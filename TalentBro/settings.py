@@ -76,7 +76,7 @@ SECRET_KEY = 'django-insecure-p6(!=nvzhn80-s56rg^8h9l_9%n&4syc(=ut4&u=%p*9knpf2m
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', 'ins-api.talentbro.in']
+ALLOWED_HOSTS = ['ins-api.talentbro.in', 'ins.talentbro.in']
 
 # Voice recordings are uploaded as raw audio (WAV) for transcription. Keep them
 # under the backend's per-request memory cap so transcription never 400s.
@@ -136,23 +136,17 @@ WSGI_APPLICATION = 'TalentBro.wsgi.application'
 # CORS - allow localhost frontends to call the service
 
 CORS_ALLOWED_ORIGINS = [
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    'http://localhost:5173',
-    'http://127.0.0.1:5173',
-    'http://localhost:8080',
-    'http://127.0.0.1:8080',
+    'https://talentbro.in',
+    'https://www.talentbro.in',
+    'https://ins.talentbro.in',
 ]
 CORS_ALLOW_CREDENTIALS = True
 
 # Origins allowed to make CSRF-protected (POST) calls from the SPA frontend.
 CSRF_TRUSTED_ORIGINS = [
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    'http://localhost:5173',
-    'http://127.0.0.1:5173',
-    'http://localhost:8080',
-    'http://127.0.0.1:8080',
+    'https://talentbro.in',
+    'https://www.talentbro.in',
+    'https://ins.talentbro.in',
 ]
 
 
