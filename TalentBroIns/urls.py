@@ -1,0 +1,101 @@
+from django.urls import path
+
+from . import views
+
+app_name = 'TalentBroIns'
+
+urlpatterns = [
+    path('auth/csrf/', views.csrf, name='auth-csrf'),
+    path('auth/signup/', views.signup, name='auth-signup'),
+    path('auth/login/', views.login_view, name='auth-login'),
+    path('auth/logout/', views.logout_view, name='auth-logout'),
+    path('auth/delete-account/', views.delete_account_view, name='auth-delete-account'),
+    path('auth/change-password/', views.change_password_view, name='auth-change-password'),
+    path('auth/me/', views.me, name='auth-me'),
+    path('auth/client-onboarding/', views.client_onboarding, name='auth-client-onboarding'),
+    path('auth/profile/', views.candidate_profile, name='auth-profile'),
+    path('auth/verify-id-card/', views.verify_id_card, name='auth-verify-id-card'),
+    path('institutions/', views.institutions_list, name='institutions-list'),
+    path('institutions/companies/', views.institution_companies, name='institution-companies'),
+    path('companies/', views.companies_list, name='companies-list'),
+    path('companies/create/', views.company_create, name='company-create'),
+    path('candidate/companies/', views.candidate_companies, name='candidate-companies'),
+    path('institution/overview/', views.institution_overview, name='institution-overview'),
+    path('students/', views.students_list, name='students-list'),
+    path('readiness/leaderboard/', views.readiness_leaderboard, name='readiness-leaderboard'),
+    path('drives/', views.drives_list, name='drives-list'),
+    path('reports/', views.reports_data, name='reports-data'),
+
+    path('chat/', views.chat, name='chat'),
+    path('chat/sessions/', views.chat_sessions, name='chat-sessions'),
+    path('chat/sessions/<uuid:session_id>/', views.chat_session_detail, name='chat-session-detail'),
+    path('chat/summarize/', views.chat_summarize, name='chat-summarize'),
+    path('chat/translate/', views.chat_translate, name='chat-translate'),
+    path('chat/onboard/', views.chat_onboard, name='chat-onboard'),
+    path('chat/complete-onboarding/', views.chat_complete_onboarding, name='chat-complete-onboarding'),
+    path('chat/communication/', views.communication_training_chat, name='communication-training-chat'),
+    path('chat/communication/turns/', views.communication_training_turns, name='communication-training-turns'),
+    path('chat/communication/finalize/', views.communication_training_finalize, name='communication-training-finalize'),
+    path('chat/communication/transcribe/', views.communication_transcribe, name='communication-transcribe'),
+    path('chat/communication/history/', views.communication_training_list, name='communication-training-list'),
+    path('chat/communication/<uuid:session_id>/', views.communication_training_detail, name='communication-training-detail'),
+
+    path('aplr/start/', views.aplr_start, name='aplr-start'),
+    path('aplr/chat/', views.aplr_chat, name='aplr-chat'),
+    path('aplr/history/', views.aplr_list, name='aplr-list'),
+    path('aplr/skip/', views.aplr_skip, name='aplr-skip'),
+    path('aplr/<uuid:session_id>/', views.aplr_detail, name='aplr-detail'),
+
+    path('basic-math/start/', views.basic_math_start, name='basic-math-start'),
+    path('basic-math/chat/', views.basic_math_chat, name='basic-math-chat'),
+    path('basic-math/history/', views.basic_math_list, name='basic-math-list'),
+    path('basic-math/skip/', views.basic_math_skip, name='basic-math-skip'),
+    path('basic-math/<uuid:session_id>/', views.basic_math_detail, name='basic-math-detail'),
+
+    path('situational/start/', views.situational_start, name='situational-start'),
+    path('situational/chat/', views.situational_chat, name='situational-chat'),
+    path('situational/history/', views.situational_list, name='situational-list'),
+    path('situational/skip/', views.situational_skip, name='situational-skip'),
+    path('situational/<uuid:session_id>/', views.situational_detail, name='situational-detail'),
+
+    path('technical/start/', views.technical_start, name='technical-start'),
+    path('technical/chat/', views.technical_chat, name='technical-chat'),
+    path('technical/history/', views.technical_list, name='technical-list'),
+    path('technical/skip/', views.technical_skip, name='technical-skip'),
+    path('technical/<uuid:session_id>/', views.technical_detail, name='technical-detail'),
+
+    path('dsa/start/', views.dsa_start, name='dsa-start'),
+    path('dsa/chat/', views.dsa_chat, name='dsa-chat'),
+    path('dsa/history/', views.dsa_list, name='dsa-list'),
+    path('dsa/skip/', views.dsa_skip, name='dsa-skip'),
+    path('dsa/<uuid:session_id>/', views.dsa_detail, name='dsa-detail'),
+
+    path('speaking-skills/', views.speaking_skills_detail, name='speaking-skills-detail'),
+    path('speaking-skills/start/', views.speaking_skills_start, name='speaking-skills-start'),
+    path('speaking-skills/chat/', views.speaking_skills_chat, name='speaking-skills-chat'),
+    path('speaking-skills/turns/', views.speaking_skills_turns, name='speaking-skills-turns'),
+    path('speaking-skills/finalize/', views.speaking_skills_finalize, name='speaking-skills-finalize'),
+    path('speaking-skills/history/', views.english_training_list, name='english-training-list'),
+    path('speaking-skills/<uuid:session_id>/', views.english_training_session_detail, name='english-training-session-detail'),
+
+    path('chat/tts/', views.tts, name='tts'),
+    path('chat/tts/voices/', views.tts_voices, name='tts-voices'),
+
+    path('interview/start/', views.mock_interview_start, name='mock-interview-start'),
+    path('interview/reply/', views.mock_interview_reply, name='mock-interview-reply'),
+    path('interview/', views.mock_interview_list, name='mock-interview-list'),
+    path('interview/<uuid:interview_id>/resume/', views.mock_interview_resume, name='mock-interview-resume'),
+    path('interview/<uuid:interview_id>/analysis/', views.mock_interview_analysis, name='mock-interview-analysis'),
+    path('interview/<uuid:interview_id>/', views.mock_interview_detail, name='mock-interview-detail'),
+
+    path('notifications/', views.notifications, name='notifications-list'),
+    path('notifications/mark-read/', views.notifications_mark_read, name='notifications-mark-read'),
+    path('notifications/<uuid:notification_id>/', views.notification_detail, name='notification-detail'),
+
+    path('gd/panelists/', views.gd_panelists, name='gd-panelists'),
+    path('gd/chat/', views.gd_chat, name='gd-chat'),
+    path('gd/topic/', views.gd_topic, name='gd-topic'),
+    path('gd/complete/', views.gd_complete, name='gd-complete'),
+    path('gd/history/', views.gd_history, name='gd-history'),
+    path('gd/<uuid:gd_id>/', views.gd_detail, name='gd-detail'),
+]
