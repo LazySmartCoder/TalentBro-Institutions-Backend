@@ -76,7 +76,7 @@ SECRET_KEY = 'django-insecure-p6(!=nvzhn80-s56rg^8h9l_9%n&4syc(=ut4&u=%p*9knpf2m
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+ALLOWED_HOSTS = ['localhost', '127.0.0.1', 'ins-api.talentbro.in']
 
 # Voice recordings are uploaded as raw audio (WAV) for transcription. Keep them
 # under the backend's per-request memory cap so transcription never 400s.
