@@ -8,15 +8,18 @@ from .models import (
     APLRTraining,
     BasicMathTraining,
     CandidateProfile,
+    CandidateRoadmap,
     ChatMessage,
     ChatSession,
     ClientProfile,
     CommunicationTraining,
     Company,
+    Drive,
     EnglishTraining,
     EnglishTrainingSession,
     GdTraining,
     Institution,
+    InstitutionsResume,
     MockInterview,
     MOCK_INTERVIEW_ANALYSIS_DIMENSIONS,
     MockInterviewAnalysis,
@@ -24,6 +27,7 @@ from .models import (
     Notification,
     NotificationReceipt,
     SituationalProblemSolvingTraining,
+    StudentMessage,
     TechnicalTraining,
     DSATraining,
 )
@@ -136,7 +140,13 @@ class InstitutionAdmin(admin.ModelAdmin):
 class CompanyInline(admin.TabularInline):
     model = Company
     extra = 0
-    fields = ('company_name', 'industry', 'recruitment_status', 'offer_status')
+    fields = (
+        'company_name',
+        'industry',
+        'tier',
+        'recruitment_status',
+        'offer_status',
+    )
     readonly_fields = ('company_id',)
 
 
@@ -188,6 +198,7 @@ class CompanyAdmin(admin.ModelAdmin):
         'company_id',
         'company_name',
         'industry',
+        'tier',
         'institution',
         'client',
         'recruitment_status',
@@ -196,6 +207,7 @@ class CompanyAdmin(admin.ModelAdmin):
         'campus_visit_date',
     )
     list_filter = (
+        'tier',
         'industry',
         'work_mode',
         'recruitment_status',
@@ -226,8 +238,8 @@ class CompanyAdmin(admin.ModelAdmin):
             'fields': (
                 'institution',
                 'client',
+                'tier',
                 'job_roles',
-                'number_of_openings',
                 'work_location',
                 'work_mode',
                 'salary_min',
@@ -261,6 +273,76 @@ class CompanyAdmin(admin.ModelAdmin):
     )
 
 
+@admin.register(Drive)
+class DriveAdmin(admin.ModelAdmin):
+    list_display = (
+        'title',
+        'company',
+        'institution',
+        'status',
+        'drive_mode',
+        'visit_date',
+        'vacancies',
+        'created_by',
+    )
+    list_filter = (
+        'status',
+        'drive_mode',
+        'institution',
+        'company',
+    )
+    search_fields = (
+        'title',
+        'company__company_name',
+        'institution__name',
+        'created_by__username',
+    )
+    autocomplete_fields = ('institution', 'company', 'created_by')
+    readonly_fields = ('created_at', 'updated_at')
+    fieldsets = (
+        ('Drive', {
+            'fields': (
+                'title',
+                'institution',
+                'company',
+                'created_by',
+                'status',
+                'drive_mode',
+                'visit_date',
+                'application_deadline',
+            ),
+        }),
+        ('Roles & Vacancies', {
+            'fields': ('roles', 'total_vacancies', 'selection_rounds'),
+            'description': (
+                'roles is a list of {"title", "description", "vacancies"} '
+                'objects. Leave total_vacancies blank to sum the roles.'
+            ),
+        }),
+        ('Package', {
+            'fields': (
+                'work_mode',
+                'work_location',
+                'salary_min',
+                'salary_max',
+            ),
+        }),
+        ('Eligibility', {
+            'fields': (
+                'eligible_courses',
+                'eligible_branches',
+                'minimum_cgpa',
+                'maximum_backlogs',
+                'graduation_year',
+                'required_skills',
+            ),
+        }),
+        ('Meta', {
+            'fields': ('notes', 'created_at', 'updated_at'),
+        }),
+    )
+
+
 @admin.register(CandidateProfile)
 class CandidateProfileAdmin(admin.ModelAdmin):
     list_display = (
@@ -272,6 +354,8 @@ class CandidateProfileAdmin(admin.ModelAdmin):
         'program',
         'start_year',
         'end_year',
+        'placement_status',
+        'placement_eligible',
         'id_verified',
         'cost_incurred',
         'time_spent',
@@ -282,6 +366,8 @@ class CandidateProfileAdmin(admin.ModelAdmin):
         'start_year',
         'end_year',
         'gender',
+        'placement_status',
+        'placement_eligible',
         'account_status',
         'id_verified',
     )
@@ -305,6 +391,7 @@ class CandidateProfileAdmin(admin.ModelAdmin):
                 'first_name',
                 'middle_name',
                 'last_name',
+                'bio',
                 'college',
                 'department',
                 'program',
@@ -322,9 +409,36 @@ class CandidateProfileAdmin(admin.ModelAdmin):
         }),
         ('Placement', {
             'fields': (
+                'placement_status',
                 'linkedin_url',
                 'github_url',
                 'portfolio_url',
+            ),
+            'description': (
+                'placement_status drives the Placed, in-selection and not-placed '
+                'counts on the placement dashboard. Only "placed" counts as '
+                'placed, so not started, applying and shortlisted are all '
+                'reported as not placed. No offer or onboarding flow writes this '
+                'field automatically: set it here, or let the profile '
+                'enrichment AI update it.'
+            ),
+        }),
+        ('Eligibility (readiness rule)', {
+            'fields': (
+                'placement_eligible',
+            ),
+            'classes': ('collapse',),
+            'description': (
+                'Every eligible figure across the dashboards, reports, drives '
+                'and student records resolves the same rule: use this override '
+                'when set, otherwise the student is eligible once their '
+                'readiness score reaches 40. Leave it blank for the normal case '
+                '(the override is then None, not False — that distinction is '
+                'the whole point). Set Yes to force a student eligible or No to '
+                'force them ineligible regardless of score. A student with no '
+                'readiness activity counts as 50, so they stay eligible until '
+                'they have been assessed. The enrichment AI cannot write this '
+                'field; only this form can.'
             ),
         }),
         ('Experience & Profile', {
@@ -910,6 +1024,78 @@ class GdTrainingAdmin(admin.ModelAdmin):
     @admin.display(description='User')
     def user_name(self, obj):
         return obj.user.get_full_name() or obj.user.username
+
+
+@admin.register(CandidateRoadmap)
+class CandidateRoadmapAdmin(admin.ModelAdmin):
+    list_display = (
+        'user_name', 'timeline_target', 'company_list', 'mocks_required',
+        'daily_practice_session_duration', 'status', 'updated_at',
+    )
+    list_filter = ('status',)
+    search_fields = (
+        'user__email', 'user__first_name', 'user__last_name',
+        'timeline_target', 'goal_statement',
+    )
+    autocomplete_fields = ('user', 'source_session')
+    readonly_fields = ('id', 'created_at', 'updated_at')
+
+    @admin.display(description='User')
+    def user_name(self, obj):
+        if obj.user_id is None:
+            return '(no user)'
+        return obj.user.get_full_name() or obj.user.username
+
+    @admin.display(description='Company targets')
+    def company_list(self, obj):
+        return ', '.join(obj.company_target or []) or '-'
+
+
+@admin.register(InstitutionsResume)
+class InstitutionsResumeAdmin(admin.ModelAdmin):
+    list_display = ('creator_name', 'institute', 'department_display', 'content_preview', 'updated_at')
+    list_filter = ('institute', 'department')
+    search_fields = (
+        'content', 'creator__email', 'creator__first_name', 'creator__last_name',
+        'institute__name',
+    )
+    autocomplete_fields = ('creator', 'institute')
+    readonly_fields = ('updated_at',)
+
+    @admin.display(description='Creator')
+    def creator_name(self, obj):
+        return obj.creator.get_full_name() or obj.creator.username
+
+    @admin.display(description='Department')
+    def department_display(self, obj):
+        return obj.department or 'General'
+
+    @admin.display(description='Content')
+    def content_preview(self, obj):
+        return obj.content[:60] or '-'
+
+
+@admin.register(StudentMessage)
+class StudentMessageAdmin(admin.ModelAdmin):
+    list_display = ('from_name', 'to_name', 'content_preview', 'created_at')
+    search_fields = (
+        'content', 'from_user__email', 'from_user__first_name', 'from_user__last_name',
+        'to_user__email', 'to_user__first_name', 'to_user__last_name',
+    )
+    autocomplete_fields = ('from_user', 'to_user')
+    readonly_fields = ('id', 'created_at')
+
+    @admin.display(ordering='from_user__first_name')
+    def from_name(self, obj):
+        return obj.from_user.get_full_name() or obj.from_user.username
+
+    @admin.display(ordering='to_user__first_name')
+    def to_name(self, obj):
+        return obj.to_user.get_full_name() or obj.to_user.username
+
+    @admin.display(description='Content')
+    def content_preview(self, obj):
+        return obj.content[:60] or '-'
 
 
 

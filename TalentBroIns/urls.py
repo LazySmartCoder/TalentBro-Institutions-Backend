@@ -14,6 +14,7 @@ urlpatterns = [
     path('auth/me/', views.me, name='auth-me'),
     path('auth/client-onboarding/', views.client_onboarding, name='auth-client-onboarding'),
     path('auth/profile/', views.candidate_profile, name='auth-profile'),
+    path('auth/profile/linkedin-fetch/', views.linkedin_profile_fetch, name='linkedin-profile-fetch'),
     path('auth/verify-id-card/', views.verify_id_card, name='auth-verify-id-card'),
     path('institutions/', views.institutions_list, name='institutions-list'),
     path('institutions/companies/', views.institution_companies, name='institution-companies'),
@@ -23,13 +24,18 @@ urlpatterns = [
     path('institution/overview/', views.institution_overview, name='institution-overview'),
     path('students/', views.students_list, name='students-list'),
     path('readiness/leaderboard/', views.readiness_leaderboard, name='readiness-leaderboard'),
+    path('students/<uuid:student_id>/messages/', views.student_messages, name='student-messages'),
     path('drives/', views.drives_list, name='drives-list'),
+    path('drives/total-vacancies/', views.drives_total_vacancies, name='drives-total-vacancies'),
     path('reports/', views.reports_data, name='reports-data'),
+    path('courses/', views.courses_list, name='courses-list'),
+    path('courses/segments/', views.course_weakness_segments, name='course-weakness-segments'),
 
     path('chat/', views.chat, name='chat'),
     path('chat/sessions/', views.chat_sessions, name='chat-sessions'),
     path('chat/sessions/<uuid:session_id>/', views.chat_session_detail, name='chat-session-detail'),
     path('chat/summarize/', views.chat_summarize, name='chat-summarize'),
+    path('roadmap/', views.candidate_roadmap, name='candidate-roadmap'),
     path('chat/translate/', views.chat_translate, name='chat-translate'),
     path('chat/onboard/', views.chat_onboard, name='chat-onboard'),
     path('chat/complete-onboarding/', views.chat_complete_onboarding, name='chat-complete-onboarding'),
@@ -81,6 +87,10 @@ urlpatterns = [
     path('chat/tts/', views.tts, name='tts'),
     path('chat/tts/voices/', views.tts_voices, name='tts-voices'),
 
+    # Read-only rollup behind the history screen. Declared ahead of the uuid
+    # routes on purpose: "stats" is not a uuid, but keeping the literal paths
+    # above the catch-all makes the precedence obvious to the next reader.
+    path('interview/stats/', views.mock_interview_stats, name='mock-interview-stats'),
     path('interview/start/', views.mock_interview_start, name='mock-interview-start'),
     path('interview/reply/', views.mock_interview_reply, name='mock-interview-reply'),
     path('interview/', views.mock_interview_list, name='mock-interview-list'),

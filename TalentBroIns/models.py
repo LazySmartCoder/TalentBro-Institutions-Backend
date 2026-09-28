@@ -243,7 +243,8 @@ class Company(models.Model):
 
     work_location = models.CharField(max_length=255, blank=True, default='')
     work_mode = models.CharField(max_length=20, choices=WORK_MODE_CHOICES, default='onsite')
-    number_of_openings = models.PositiveIntegerField(null=True, blank=True)
+    # Openings are not tracked here - they belong to the Drive, which is what
+    # actually launches the roles. See Drive.total_vacancies / Drive.vacancies.
     selection_rounds = models.JSONField(default=list, blank=True)
 
     application_deadline = models.DateField(null=True, blank=True)
@@ -296,6 +297,127 @@ class Company(models.Model):
         )[:5] or 'CMP'
         suffix = uuid.uuid4().hex[:6].upper()
         return f'{stem}-{suffix}'
+
+
+DRIVE_MODE_CHOICES = [
+    ('campus', 'On Campus'),
+    ('virtual', 'Virtual Drive'),
+    ('off_campus', 'Off Campus'),
+]
+
+# Shape of one entry in Drive.roles: {"title": ..., "description": ...,
+# "vacancies": <int>}. A plain list keeps a whole drive in one row.
+DRIVE_ROLE_KEYS = ('title', 'description', 'vacancies')
+
+
+class Drive(models.Model):
+    """One placement drive: a company visiting an institution to launch roles.
+
+    A Drive is the event record that sits on top of Company. The company row
+    holds the long-lived recruiter relationship (tier, industry, contact);
+    the drive holds what this particular visit is offering - the roles being
+    launched, their vacancy counts, the visit date and the eligibility bar.
+    """
+
+    institution = models.ForeignKey(
+        Institution,
+        on_delete=models.CASCADE,
+        related_name='drives',
+        help_text='The institution hosting the drive.',
+    )
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='drives',
+        help_text='The company visiting the institution.',
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='drives_created',
+        help_text='The staff account that scheduled this drive.',
+    )
+
+    title = models.CharField(
+        max_length=255,
+        help_text='e.g. TCS Campus Drive 2026.',
+    )
+    # Roles being launched. Each entry is a dict with 'title', 'description'
+    # and 'vacancies' - see DRIVE_ROLE_KEYS.
+    roles = models.JSONField(
+        default=list, blank=True,
+        help_text='Roles launched by this drive, each {"title", "description", "vacancies"}.',
+    )
+    total_vacancies = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Total openings across every role. Left blank to sum the roles.',
+    )
+
+    drive_mode = models.CharField(
+        max_length=20, choices=DRIVE_MODE_CHOICES, default='campus',
+    )
+    status = models.CharField(
+        max_length=20, choices=RECRUITMENT_STATUS_CHOICES, default='upcoming',
+    )
+    visit_date = models.DateField(
+        null=True, blank=True,
+        help_text='Date the company visits the campus.',
+    )
+    application_deadline = models.DateField(null=True, blank=True)
+
+    work_mode = models.CharField(
+        max_length=20, choices=WORK_MODE_CHOICES, default='onsite',
+    )
+    work_location = models.CharField(max_length=255, blank=True, default='')
+    salary_min = models.DecimalField(
+        max_digits=8, decimal_places=2, null=True, blank=True,
+        help_text='Minimum annual CTC in LPA.',
+    )
+    salary_max = models.DecimalField(
+        max_digits=8, decimal_places=2, null=True, blank=True,
+        help_text='Maximum annual CTC in LPA.',
+    )
+
+    # Eligibility bar for this drive. Blank lists mean "everyone eligible".
+    eligible_branches = models.JSONField(default=list, blank=True)
+    eligible_courses = models.JSONField(default=list, blank=True)
+    minimum_cgpa = models.DecimalField(
+        max_digits=4, decimal_places=2, null=True, blank=True,
+        help_text='Minimum CGPA required (on a 10-point scale).',
+    )
+    maximum_backlogs = models.PositiveSmallIntegerField(null=True, blank=True)
+    graduation_year = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Batch year eligible for the drive (e.g. 2026).',
+    )
+    required_skills = models.JSONField(default=list, blank=True)
+    selection_rounds = models.JSONField(default=list, blank=True)
+
+    notes = models.TextField(
+        blank=True, default='',
+        help_text='Anything else students should know about the visit.',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-visit_date', '-created_at']
+
+    def __str__(self):
+        return f'{self.title} — {self.company.company_name}'
+
+    @property
+    def vacancies(self):
+        """Total openings: the stored total, else summed from the roles."""
+        if self.total_vacancies is not None:
+            return self.total_vacancies
+        return sum(
+            int(role.get('vacancies') or 0)
+            for role in self.roles
+            if isinstance(role, dict)
+        )
 
 
 GENDER_CHOICES = [
@@ -393,6 +515,13 @@ class CandidateProfile(models.Model):
 
     personal_email = models.EmailField(blank=True, default='')
     avatar = models.URLField(blank=True, default='')
+    bio = models.TextField(
+        blank=True, default='', max_length=500,
+        help_text=(
+            "The candidate's professional headline. Filled in from their LinkedIn "
+            "headline, and editable by the candidate afterwards."
+        ),
+    )
     mobile_number = models.CharField(
         max_length=16, blank=True, default='',
         validators=[MOBILE_NUMBER_VALIDATOR],
@@ -408,7 +537,21 @@ class CandidateProfile(models.Model):
         choices=PLACEMENT_STATUS_CHOICES,
         default='not_started',
     )
-    placement_eligible = models.BooleanField(default=True)
+    # Not a stored verdict but a staff override: null means "no opinion, follow
+    # the readiness rule" (readiness_score >= PLACEMENT_READY_SCORE), while
+    # True/False pin the student regardless of their score. Every eligibility
+    # figure in the API resolves the override first, so this column is never
+    # read on its own. A candidate with no readiness activity is scored at
+    # PERF_NEUTRAL_SCORE, so leaving this null keeps them eligible.
+    placement_eligible = models.BooleanField(
+        null=True, default=None, blank=True,
+        verbose_name='Placement eligible (override)',
+        help_text=(
+            "Leave blank to follow the readiness rule (score >= 40). Set Yes to "
+            "force a student eligible or No to force them ineligible regardless "
+            "of their readiness score."
+        ),
+    )
 
     linkedin_url = models.URLField(blank=True, default='')
     github_url = models.URLField(blank=True)
@@ -485,6 +628,52 @@ class CandidateProfile(models.Model):
     readiness_updated_at = models.DateTimeField(
         null=True, blank=True,
         help_text='When this candidate\'s readiness score and ranks were last recomputed.',
+    )
+
+    # Independent rankings, one pair per practice pillar. Each pillar is ranked
+    # over its OWN cohort (only the candidates who actually have that pillar),
+    # so mock-interview performance can never move a candidate's self-training
+    # standing and vice versa. The composite readiness score/AIR above blends
+    # all pillars; these never do.
+    mock_interview_score = models.FloatField(
+        null=True, blank=True,
+        help_text='Moderated Mock Interview score (0–100) for this candidate.',
+    )
+    mock_interview_rank = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Rank among the college candidates who have a mock-interview score.',
+    )
+    mock_interview_total = models.PositiveIntegerField(
+        default=0,
+        help_text='Number of college candidates in the mock-interview ranking cohort.',
+    )
+    mock_interview_department_rank = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Rank among same-department peers in the mock-interview cohort.',
+    )
+    mock_interview_department_total = models.PositiveIntegerField(
+        default=0,
+        help_text='Department size of the mock-interview ranking cohort.',
+    )
+    self_training_score = models.FloatField(
+        null=True, blank=True,
+        help_text='Moderated Self-Training score (0–100) for this candidate.',
+    )
+    self_training_rank = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Rank among the college candidates who have a self-training score.',
+    )
+    self_training_total = models.PositiveIntegerField(
+        default=0,
+        help_text='Number of college candidates in the self-training ranking cohort.',
+    )
+    self_training_department_rank = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Rank among same-department peers in the self-training cohort.',
+    )
+    self_training_department_total = models.PositiveIntegerField(
+        default=0,
+        help_text='Department size of the self-training ranking cohort.',
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1024,7 +1213,15 @@ class DSATraining(models.Model):
 MOCK_INTERVIEW_STATUS_CHOICES = [
     ('active', 'Active'),
     ('completed', 'Completed'),
+    # Finished, but the candidate never gave enough real answers to score, so
+    # the interview is deliberately left unscored instead of being given an
+    # invented number.
+    ('not_scored', 'Not Scored — Not Enough Answers'),
 ]
+
+MOCK_INTERVIEW_STATUS_ACTIVE = 'active'
+MOCK_INTERVIEW_STATUS_COMPLETED = 'completed'
+MOCK_INTERVIEW_STATUS_INSUFFICIENT = 'not_scored'
 
 
 class MockInterview(models.Model):
@@ -1566,6 +1763,100 @@ class ProfileUpdateSummary(models.Model):
         return f'{self.source} summary for {self.user.get_full_name() or self.user.username}'
 
 
+ROADMAP_STATUS_CHOICES = [
+    ('active', 'Active'),
+    ('completed', 'Completed'),
+    ('archived', 'Archived'),
+]
+
+ROADMAP_STATUS_ACTIVE = 'active'
+ROADMAP_STATUS_COMPLETED = 'completed'
+ROADMAP_STATUS_ARCHIVED = 'archived'
+
+
+class CandidateRoadmap(models.Model):
+    """Structured placement-preparation roadmap derived from a roadmap chat.
+
+    Built (and upserted — one row per candidate) whenever a chat session that
+    discusses a preparation roadmap ends. Holds the two goal anchors the student
+    expressed (a timeline target till a date/month and the target companies)
+    plus the model-generated comprehensive plan: how many mock interviews are
+    required, the recommended daily practice-session duration, and per-module
+    self-training requirements covering every training module on the platform.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='candidate_roadmap',
+        null=True, blank=True,
+    )
+    source_session = models.ForeignKey(
+        ChatSession,
+        on_delete=models.SET_NULL,
+        related_name='roadmap',
+        null=True, blank=True,
+        help_text='The chat session the roadmap was last generated from.',
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=ROADMAP_STATUS_CHOICES,
+        default=ROADMAP_STATUS_ACTIVE,
+    )
+
+    # Goal anchors the candidate expressed during the roadmap chat.
+    timeline_target = models.CharField(
+        max_length=255, blank=True, default='',
+        help_text='Raw timeline goal, e.g. "placement prepared by the end of this month".',
+    )
+    target_date = models.DateField(
+        null=True, blank=True,
+        help_text='Normalised target deadline (ISO date) when the goal maps to a concrete date.',
+    )
+    company_target = models.JSONField(
+        default=list, blank=True,
+        help_text='Companies the candidate wants to get placed in (e.g. ["TCS", "Accenture"]).',
+    )
+    goal_statement = models.TextField(
+        blank=True, default='',
+        help_text='Paraphrased, unambiguous statement of the placement goal.',
+    )
+
+    # Model-generated comprehensive plan.
+    mocks_required = models.PositiveIntegerField(
+        default=0,
+        help_text='Number of mock interviews recommended before the placement drive.',
+    )
+    daily_practice_session_duration = models.PositiveIntegerField(
+        default=0,
+        help_text='Recommended daily practice-session duration in minutes.',
+    )
+    self_training_required = models.JSONField(
+        default=dict, blank=True,
+        help_text='Per-module self-training requirements: {module: {required, sessions_per_week, focus_areas}}.',
+    )
+    roadmap = models.JSONField(
+        default=dict, blank=True,
+        help_text='Comprehensive plan — phased weeks, topics and a weekly schedule.',
+    )
+    summary = models.TextField(
+        blank=True, default='',
+        help_text='Natural-language summary of the generated roadmap.',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        if self.user_id is None:
+            return 'CandidateRoadmap'
+        return f'Roadmap for {self.user.get_full_name() or self.user.username}'
+
+
 GD_STATUS_CHOICES = [
     ('active', 'Active'),
     ('completed', 'Completed'),
@@ -1699,3 +1990,54 @@ class GdTraining(models.Model):
 
     def __str__(self):
         return f'{self.topic[:60] or self.title or "GD round"} ({self.user.get_full_name() or self.user.username})'
+
+
+class StudentMessage(models.Model):
+    """A direct message one student sent to another student.
+
+    Unlike ChatMessage (student↔Gemini turns) this is a plain person-to-person
+    note opened from a candidate's detail page, so it only needs the sender,
+    the recipient, the body and when it was sent.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    from_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='student_messages_sent',
+    )
+    to_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='student_messages_received',
+    )
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f'{self.from_user.username} → {self.to_user.username}: {self.content[:40]}'
+
+
+class InstitutionsResume(models.Model):
+    creator = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='institution_resumes',
+    )
+    institute = models.ForeignKey(
+        Institution,
+        on_delete=models.CASCADE,
+        related_name='resumes',
+    )
+    department = models.CharField(max_length=255, blank=True, default='')
+    content = models.TextField(blank=True, default='')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f'{self.institute.name} — {self.department or "General"}'

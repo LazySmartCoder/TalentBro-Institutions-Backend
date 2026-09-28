@@ -76,7 +76,7 @@ SECRET_KEY = 'django-insecure-p6(!=nvzhn80-s56rg^8h9l_9%n&4syc(=ut4&u=%p*9knpf2m
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['ins-api.talentbro.in', 'ins.talentbro.in']
+ALLOWED_HOSTS = ['ins-api.talentbro.in', 'ins.talentbro.in', 'localhost', '127.0.0.1']
 
 # Voice recordings are uploaded as raw audio (WAV) for transcription. Keep them
 # under the backend's per-request memory cap so transcription never 400s.
@@ -139,6 +139,10 @@ CORS_ALLOWED_ORIGINS = [
     'https://talentbro.in',
     'https://www.talentbro.in',
     'https://ins.talentbro.in',
+    'http://localhost:8080',
+    'http://127.0.0.1:8080',
+    'http://localhost:8081',
+    'http://127.0.0.1:8081',
 ]
 CORS_ALLOW_CREDENTIALS = True
 
@@ -147,6 +151,10 @@ CSRF_TRUSTED_ORIGINS = [
     'https://talentbro.in',
     'https://www.talentbro.in',
     'https://ins.talentbro.in',
+    'http://localhost:8080',
+    'http://127.0.0.1:8080',
+    'http://localhost:8081',
+    'http://127.0.0.1:8081',
 ]
 
 
@@ -227,3 +235,7 @@ GEMINI_ONBOARDING_MODEL = os.environ.get(
 # transcription. If unset, the backend falls back to Gemini audio transcription.
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '').strip()
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'whisper-large-v3-turbo').strip()
+
+# LinkedIn profile photo enrichment via the Apify linkedin-profile-scraper actor.
+# Used by the candidate "Complete profile" flow to fetch the profile photo URL.
+APIFY_TOKEN = os.environ.get('APIFY_TOKEN', '').strip()

@@ -8,7 +8,10 @@ from TalentBroIns.views import _refresh_readiness_college
 
 
 class Command(BaseCommand):
-    help = 'Recompute and persist readiness score / AIR / department rank for every candidate.'
+    help = (
+        'Recompute and persist readiness score / AIR / department rank and the '
+        'independent mock-interview and self-training ranks for every candidate.'
+    )
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -41,12 +44,16 @@ class Command(BaseCommand):
         )
         updated = 0
         for cid in colleges:
-            _, overall, department, totals = _refresh_readiness_college(college_id=cid)
+            _, overall, department, totals, pillar_ranks = _refresh_readiness_college(
+                college_id=cid,
+            )
             updated += len(overall)
             self.stdout.write(
                 f'College {cid}: {len(overall)} ranked of '
                 f'{totals["overall_total"]} total '
-                f'({len(department)} departments)'
+                f'({len(department)} departments, '
+                f'mock cohort {pillar_ranks["mock_interview"]["total"]}, '
+                f'self-training cohort {pillar_ranks["self_training"]["total"]})'
             )
 
         elapsed = time.time() - started

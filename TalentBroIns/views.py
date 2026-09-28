@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import datetime
 import json
 import logging
@@ -20,7 +20,8 @@ from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Avg, Count, Q, Sum
+from django.db.models import Avg, BooleanField, Case, Count, F, Q, Sum, Value, When
+from django.db.models.functions import Coalesce, Length
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -28,6 +29,8 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from .company_insights import company_context_block
+from .coursera_scraper import COURSERA_DEFAULT_QUERY, get_courses
+from .weakness_segments import collect_weakness_segments
 from .gemini_cost import record_cost_incurred
 
 from .models import (
@@ -54,9 +57,11 @@ from .models import (
     DSA_STATUS_SOLVED,
     ChatMessage,
     ChatSession,
+    CandidateRoadmap,
     ClientProfile,
-CommunicationTraining,
+    CommunicationTraining,
     Company,
+    Drive,
     EnglishTraining,
     EnglishTrainingSession,
     GdTraining,
@@ -67,6 +72,9 @@ CommunicationTraining,
     LANGUAGE_CHOICES,
     MockInterview,
     MOCK_INTERVIEW_ANALYSIS_DIMENSIONS,
+    MOCK_INTERVIEW_STATUS_ACTIVE,
+    MOCK_INTERVIEW_STATUS_COMPLETED,
+    MOCK_INTERVIEW_STATUS_INSUFFICIENT,
     MockInterviewAnalysis,
     MockInterviewMessage,
     Notification,
@@ -75,8 +83,11 @@ CommunicationTraining,
     NOTIFICATION_SENDER_PLACEMENT_CELL,
     PLACEMENT_STATUS_CHOICES,
     ProfileUpdateSummary,
+    RECRUITMENT_STATUS_CHOICES,
+    ROADMAP_STATUS_ACTIVE,
     ROLE_INSTITUTION_STAFF,
     ROLE_STUDENT,
+    StudentMessage,
     user_role,
 )
 
@@ -501,7 +512,7 @@ def _update_profile_tool(user, fields):
 def _user_payload(user, role=None):
     # Query fresh: reading ``user.institution`` can return a stale reverse-cache
     # from a failed `Institution.objects.create` in the same request.
-    institution = Institution.objects.filter(user_id=user.pk).first()
+    institution = _client_institution(user)
     if role not in ROLE_SESSION_KEYS:
         role = user_role(user)
     role = ROLE_ALIASES.get(role, role)
@@ -556,7 +567,7 @@ def _embedded_profile(user, role):
     profile = ClientProfile.objects.filter(user_id=user.pk).first()
     if profile is None:
         return None
-    institution = Institution.objects.filter(user_id=user.pk).first()
+    institution = _client_institution(user)
     return {
         'id': profile.pk,
         'institution_name': profile.institution.name if profile.institution else None,
@@ -919,8 +930,10 @@ def client_onboarding(request):
     if not re.fullmatch(r'[1-9][0-9]{5}', institution_fields['pin_code']):
         return JsonResponse({'detail': 'PIN Code must be a valid 6-digit postal code.'}, status=400)
 
-    # Create or update the client's Institution.
-    institution = Institution.objects.filter(user_id=user.pk).first()
+    # Create or update the client's Institution. Reuse the institution already
+    # linked to the client (shared with the rest of their placement cell) so a
+    # profile edit updates it instead of spawning a duplicate row.
+    institution = _client_institution(user)
     if institution is None:
         institution = Institution(user=user)
     institution.name = institution_fields['institution_name']
@@ -937,19 +950,21 @@ def client_onboarding(request):
     institution.approximate_student_strength = approximate_student_strength
     institution.save()
 
-    # Update the client's own profile, defaulting access to Master.
-    profile, _ = ClientProfile.objects.get_or_create(
+    # Update the client's own profile, defaulting access to Master only for
+    # brand-new clients (existing staff keep whatever access their admin set).
+    profile, profile_created = ClientProfile.objects.get_or_create(
         user=user,
         defaults={
             'full_name': user.get_full_name() or user.username,
             'official_email': user.email,
         },
     )
+    if profile_created:
+        profile.access = ClientProfile.ACCESS_MASTER
     profile.institution = institution
     profile.mobile_number = profile_fields['mobile_number']
     profile.designation = profile_fields['designation']
     profile.employee_staff_id = profile_fields['employee_staff_id']
-    profile.access = ClientProfile.ACCESS_MASTER
     profile.save()
 
     role = user_role(user)
@@ -975,8 +990,14 @@ PROFILE_FIELD_MAP = {
     'time_spent': 'time_spent',
     'personal_email': 'personal_email',
     'placement_status': 'placement_status',
-    'placement_eligible': 'placement_eligible',
+    # placement_eligible is deliberately absent: it is a nullable staff
+    # override, and letting the AI pin it would freeze the student as eligible
+    # (or ineligible) regardless of their readiness score. The AI may reason
+    # about eligibility, but only the placement office writes the override.
     'preferred_language': 'preferred_language',
+    # 'bio' is candidate-editable, but deliberately not in PROFILE_STRING_FIELDS:
+    # the AI must not overwrite the LinkedIn headline we sync into it.
+    'bio': 'bio',
 }
 PROFILE_LIST_FIELDS = [
     'skills', 'certifications', 'projects', 'internships',
@@ -1188,7 +1209,11 @@ def _client_missing_fields(user, profile):
     if profile is None:
         return list(CLIENT_REQUIRED_KEYS)
 
-    institution = Institution.objects.filter(user_id=user.pk).first()
+    institution = None
+    if profile.institution_id:
+        institution = profile.institution
+    if institution is None:
+        institution = Institution.objects.filter(user_id=user.pk).first()
     values = {
         'institution_name': institution.name if institution else '',
         'institution_type': institution.institution_type if institution else '',
@@ -1228,15 +1253,24 @@ def _guess_missing_profile(user):
 # ---------------------------------------------------------------------------
 # TalentBro Readiness Score & rankings
 #
-# A student's rank (overall, and within their department) is derived from one
-# composite "readiness" score that deliberately blends the signals the platform
-# actually measures:
+# Three separate things live here, and they are deliberately kept apart:
 #
-#   * Mock Interview (36) — the mean of every completed interview analysis, each
-#                           itself the mean of the dimensions the evaluator
-#                           actually assessed on the 34-point rubric.
-#   * Self-Training  (36) — the mean of the eight self-training modules, so a
-#                           student is judged across every practice surface.
+# 1. Pillar scores (mock interview, self-training, chat) — each measured only
+#    from its own data, each moderated so a thin sample of evidence cannot
+#    produce an extreme number (see :func:`_moderate_score`).
+# 2. Independent pillar rankings — mock-interview and self-training candidates
+#    are ranked against their own cohort only (see :func:`_pillar_ranks`), so
+#    neither pillar can drag the other one's standing up or down.
+# 3. One composite "readiness" score (and the AIR that follows from it) that
+#    blends the pillars a student has actually started:
+#
+#   * Mock Interview (36) — the mean of every completed, scorable interview
+#                           analysis, each itself the moderated mean of the
+#                           rubric dimensions the evaluator found real
+#                           evidence for.
+#   * Self-Training  (36) — the moderated mean of the eight self-training
+#                           modules, so a student is judged across practice
+#                           surfaces and not on one lucky question.
 #   * Chat           (18) — how much the student has genuinely talked to the
 #                           coach in /chat (their own turns), on a saturating
 #                           curve so a handful of messages cannot dominate.
@@ -1254,6 +1288,95 @@ PERF_WEIGHTS = {
     'self_training': 36,
     'chat': 18,
 }
+
+# Pillars that get their own independent leaderboard, each ranked over its own
+# cohort. The composite readiness score above is never one of these numbers.
+PERF_RANKED_PILLARS = ('mock_interview', 'self_training')
+
+# The midpoint a thin-evidence score is pulled toward. 50 is the only honest
+# answer to "the candidate gave us almost nothing to judge" — not a 2 (cruel)
+# and not a 90 (meaningless).
+PERF_NEUTRAL_SCORE = 50
+
+# The readiness score at which a candidate counts as placement eligible. This is
+# the single definition of "eligible" in the product: every dashboard, report,
+# drive pool and student record resolves it through the two helpers below.
+PLACEMENT_READY_SCORE = 40
+
+# CandidateProfile.placement_eligible is a *nullable staff override*, not a
+# stored verdict: null means "no opinion, follow the readiness score", while
+# True/False pin the student whatever their score says. The effective value is
+#
+#     placement_eligible if it is not null else readiness_score >= 40
+#
+# A candidate with no readiness activity at all has readiness_score=None, and is
+# scored at PERF_NEUTRAL_SCORE for this purpose so that starting out on the
+# platform never disqualifies them — the same "we have nothing to judge them on"
+# answer the scorer already gives. Nothing is ever written back from the score:
+# these are pure read-time helpers, so the twenty-odd places that refresh
+# readiness need no changes and no candidate row is churned.
+
+
+def _effective_eligible(candidate):
+    """Resolve one CandidateProfile (or anything with the two attributes)."""
+    override = getattr(candidate, 'placement_eligible', None)
+    if override is not None:
+        return bool(override)
+    score = getattr(candidate, 'readiness_score', None)
+    if score is None:
+        score = PERF_NEUTRAL_SCORE
+    return score >= PLACEMENT_READY_SCORE
+
+
+def _with_effective_eligibility(queryset):
+    """Annotate ``effective_eligible`` so it can be filtered/aggregated in SQL.
+
+    Mirrors :func:`_effective_eligible` exactly; the Python version is for the
+    call sites that already iterate candidates in Python.
+    """
+    # A candidate with no readiness activity has readiness_score=None and is
+    # scored at PERF_NEUTRAL_SCORE for this purpose, so they clear the bar
+    # whenever that neutral score does. This spells the rule out in Q objects
+    # rather than comparing a Coalesce() to PLACEMENT_READY_SCORE directly:
+    # Django's Func subclasses don't implement comparison operators, so that
+    # form raises TypeError while the module is being imported.
+    ready = Q(readiness_score__gte=PLACEMENT_READY_SCORE)
+    if PERF_NEUTRAL_SCORE >= PLACEMENT_READY_SCORE:
+        ready = Q(readiness_score__isnull=True) | ready
+    return queryset.annotate(
+        effective_eligible=Case(
+            When(placement_eligible__isnull=False, then=F('placement_eligible')),
+            default=ready,
+            output_field=BooleanField(),
+        )
+    )
+
+# How much of a score survives at zero coverage. A pillar backed by a single
+# signal keeps 70% (self-training) / 60% (mock interview) of its distance from
+# the midpoint and earns the rest back as real evidence accumulates, so the
+# scoring is neither harsh on a beginner nor inflated by thin data.
+PERF_SELF_TRAINING_SHRINK_FLOOR = 0.7
+PERF_MOCK_SHRINK_FLOOR = 0.6
+
+# A mock interview is only worth scoring once the candidate has actually
+# answered. Below this many of their own turns the interview is closed as
+# "not enough evidence" — no analysis, no score, no notification and no
+# contribution to the mock pillar, so a silent session can never be handed an
+# invented 48/100.
+MOCK_INTERVIEW_MIN_USER_TURNS = 3
+
+# ...and the evaluation itself must back at least this many rubric dimensions
+# with real, transcript-grounded evidence before any number is published.
+MOCK_MIN_SCORED_DIMENSIONS = 3
+
+# Minimum length (in words) of a dimension's evidence before it counts. Real
+# evidence is a quoted, specific observation; "not addressed" and "no evidence"
+# notes are one or two words and are ignored instead of being scored.
+MOCK_EVIDENCE_MIN_WORDS = 8
+
+# Resolved questions (solved + gave up) a one-question-per-chat module needs
+# before its score counts at all. A single lucky answer is not a module score.
+PERF_QUESTION_MODULE_MIN_RESOLVED = 2
 
 # Student turns in /chat needed to saturate the chat-engagement pillar at 100.
 CHAT_MESSAGE_TARGET = 100
@@ -1282,16 +1405,77 @@ PERF_MODULE_LABELS = {
 }
 
 
+def _moderate_score(raw, coverage, floor=PERF_SELF_TRAINING_SHRINK_FLOOR):
+    """Pull a 0-100 score toward the neutral midpoint by how thin its evidence is.
+
+    ``coverage`` is the fraction of the rubric/module set the student actually
+    exercised (0-1). At full coverage the score is returned untouched. As coverage
+    falls, the score keeps ``floor`` of its distance from the midpoint and earns
+    the rest back as evidence accumulates — so a strong claim on two dimensions of
+    thirty-four is reported as near-middling rather than as a 100, and a weak one is
+    not reported as a zero. Neither a beginner nor a strong performer is crowned or
+    sunk by a single thin signal.
+    """
+    coverage = max(0.0, min(1.0, float(coverage or 0)))
+    factor = floor + (1 - floor) * coverage
+    return round(PERF_NEUTRAL_SCORE + (raw - PERF_NEUTRAL_SCORE) * factor)
+
+
+def _has_evidence(text):
+    """True when a description carries real, specific evidence.
+
+    A grounded observation is a quoted, specific sentence or two; a
+    "the candidate did not address this" note is a couple of words. Counting
+    words keeps the check independent of how the evaluator phrased the miss.
+    """
+    return len(str(text or '').split()) >= MOCK_EVIDENCE_MIN_WORDS
+
+
+def _mock_user_turns(interview):
+    """How many answers the candidate actually gave in a mock interview."""
+    return interview.messages.filter(role='user').count()
+
+
+def _mock_analysis_score(dimensions):
+    """Moderated 0-100 score for one mock-interview analysis, or None.
+
+    ``dimensions`` is an iterable of ``(score, description)`` for the whole
+    rubric. Dimensions whose description carries no real evidence are dropped
+    entirely: they are neither rewarded nor punished, because a dimension the
+    candidate was never asked about is missing data, not a failure. What is left
+    must cover at least :data:`MOCK_MIN_SCORED_DIMENSIONS` dimensions to count at
+    all, and its mean is then pulled toward the neutral midpoint in proportion to
+    how much of the rubric the interview actually exercised.
+
+    Returns None when there is not enough evidence to publish a number — which is
+    what stops an unanswered interview from being handed a fabricated score.
+    """
+    evidenced = [
+        max(0, min(100, _as_int(score, 0)))
+        for score, description in dimensions
+        if _has_evidence(description)
+    ]
+    if len(evidenced) < MOCK_MIN_SCORED_DIMENSIONS:
+        return None
+    return _moderate_score(
+        sum(evidenced) / len(evidenced),
+        len(evidenced) / len(MOCK_INTERVIEW_ANALYSIS_DIMENSIONS),
+        floor=PERF_MOCK_SHRINK_FLOOR,
+    )
+
+
 def _perf_question_module_score(solved, gave_up, avg_star):
     """0-100 score for one question-per-chat module.
 
     Deliberately weighs correctness first and approach quality second:
     60% solve-rate (solved / resolved) + 40% average star rating. Returns None
-    while nothing has been resolved yet, so an untouched/in-progress module does
-    not drag the self-training pillar down.
+    while fewer than :data:`PERF_QUESTION_MODULE_MIN_RESOLVED` questions have
+    actually been resolved, so one lucky answer cannot stand in for a module,
+    and an untouched/in-progress module does not drag the self-training pillar
+    down.
     """
     resolved = (solved or 0) + (gave_up or 0)
-    if resolved <= 0:
+    if resolved < PERF_QUESTION_MODULE_MIN_RESOLVED:
         return None
     solve_rate = (solved or 0) / resolved
     star = max(0.0, min(5.0, float(avg_star or 0)))
@@ -1315,8 +1499,14 @@ def _perf_components(*, user_id, chat_stats, mock_stats, training_stats):
     modules = training_stats.get(user_id) or {}
     if modules:
         module_scores = list(modules.values())
+        # Breadth counts: the mean is pulled back toward the midpoint until the
+        # student has worked across the modules, so one strong (or one weak)
+        # module speaks with its own weight instead of the whole pillar's.
         pillars['self_training'] = {
-            'score': round(sum(module_scores) / len(module_scores)),
+            'score': _moderate_score(
+                sum(module_scores) / len(module_scores),
+                len(module_scores) / len(PERF_MODULE_LABELS),
+            ),
             'modules': modules,
         }
 
@@ -1380,23 +1570,32 @@ def _performance_scores(profiles):
             )
 
         # --- mock interview analyses -------------------------------------
+        # Only interviews the candidate genuinely answered in are eligible, and
+        # only rubric dimensions the evaluator could back with evidence inside
+        # those interviews count towards the pillar.
         value_fields = ['user_id']
         for field, _name, _definition in MOCK_INTERVIEW_ANALYSIS_DIMENSIONS:
             value_fields.append(field)
             value_fields.append(f'{field}_desc')
         per_user = {}
-        for row in MockInterviewAnalysis.objects.filter(
-            user_id__in=user_ids
-        ).values(*value_fields):
-            scores = [
-                row[field]
+        for row in (
+            MockInterviewAnalysis.objects
+            .filter(user_id__in=user_ids)
+            .annotate(
+                user_turns=Count(
+                    'interview__messages',
+                    filter=Q(interview__messages__role='user'),
+                ),
+            )
+            .filter(user_turns__gte=MOCK_INTERVIEW_MIN_USER_TURNS)
+            .values(*value_fields)
+        ):
+            score = _mock_analysis_score([
+                (row[field], row[f'{field}_desc'])
                 for field, _name, _definition in MOCK_INTERVIEW_ANALYSIS_DIMENSIONS
-                if row[f'{field}_desc']
-            ]
-            if scores:
-                per_user.setdefault(row['user_id'], []).append(
-                    sum(scores) / len(scores)
-                )
+            ])
+            if score is not None:
+                per_user.setdefault(row['user_id'], []).append(score)
         for user_id, values in per_user.items():
             mock_stats[user_id] = (
                 round(sum(values) / len(values)), len(values),
@@ -1434,20 +1633,42 @@ def _performance_scores(profiles):
                 'communication'
             ] = round(row['avg'])
 
-        # --- self-training: lifelong English writing score ---------------
+        # --- self-training: English writing --------------------------------
+        # Averaged, not last-write-wins: a student with several analysed sessions
+        # gets their own average instead of whatever the most recent (or the
+        # first) row happens to be. The lifelong one-row summary is only a
+        # fallback for students whose sessions predate the session rows.
         for row in (
-            EnglishTraining.objects
-            .filter(user_id__in=user_ids, writing_score__gt=0)
-            .values('user_id', 'writing_score')
+            EnglishTrainingSession.objects
+            .filter(
+                user_id__in=user_ids,
+                writing_score__gt=0,
+                finalized_at__isnull=False,
+            )
+            .values('user_id')
+            .annotate(avg=Avg('writing_score'))
         ):
             training_stats.setdefault(row['user_id'], {})[
                 'english'
-            ] = int(row['writing_score'])
+            ] = round(row['avg'])
+        for row in (
+            EnglishTraining.objects
+            .filter(user_id__in=user_ids, writing_score__gt=0)
+            .values('user_id')
+            .annotate(avg=Avg('writing_score'))
+        ):
+            if 'english' in training_stats.get(row['user_id'], {}):
+                continue
+            training_stats.setdefault(row['user_id'], {})[
+                'english'
+            ] = round(row['avg'])
 
         # --- self-training: group discussion -----------------------------
+        # Rounds the student barely spoke in are never scored server-side, so
+        # they stay at 0 and drop out here rather than averaging in noise.
         for row in (
             GdTraining.objects
-            .filter(user_id__in=user_ids, status='completed')
+            .filter(user_id__in=user_ids, status='completed', overall_score__gt=0)
             .values('user_id')
             .annotate(avg=Avg('overall_score'))
         ):
@@ -1497,6 +1718,73 @@ def _rank_map(scores):
             last_rank = index
             last_value = value
     return ranks
+
+
+def _pillar_score_map(score_map):
+    """``{pillar: {candidate_key: score}}`` for every ranked pillar."""
+    scores = {pillar: {} for pillar in PERF_RANKED_PILLARS}
+    for key, components in score_map.items():
+        pillars = (components or {}).get('pillars') or {}
+        for pillar in PERF_RANKED_PILLARS:
+            value = (pillars.get(pillar) or {}).get('score')
+            if value is not None:
+                scores[pillar][key] = value
+    return scores
+
+
+def _pillar_ranks(profiles, score_map):
+    """Rank every pillar independently over its own cohort.
+
+    Each pillar in :data:`PERF_RANKED_PILLARS` gets its own competition ranks,
+    computed only from the candidates who actually have that pillar. That is the
+    whole point: a candidate's mock-interview score can never move their
+    self-training rank (and vice versa), and a candidate who has never done a
+    mock interview is simply absent from the mock board instead of dragging the
+    board around with a self-training number wearing a mock label.
+
+    Returns ``{pillar: {'scores': {key: score}, 'overall': {key: rank},
+    'department': {dept: {key: rank}}, 'total': n,
+    'department_totals': {dept: n}}}``. The totals count the pillar's own
+    cohort (not the college roll) so a rank always reads as "#4 of the 27
+    students who have mock interviews".
+    """
+    ranked = {}
+    for pillar, scores in _pillar_score_map(score_map).items():
+        by_department = {}
+        for profile in profiles:
+            key = str(profile.candidate_id)
+            if key in scores:
+                by_department.setdefault(profile.department or '', {})[key] = (
+                    scores[key]
+                )
+        ranked[pillar] = {
+            'scores': scores,
+            'overall': _rank_map(scores),
+            'department': {
+                dept: _rank_map(values) for dept, values in by_department.items()
+            },
+            'total': len(scores),
+            'department_totals': {
+                dept: len(values) for dept, values in by_department.items()
+            },
+        }
+    return ranked
+
+
+def _pillar_rank_payload(pillar_ranks, pillar, key=None, department=''):
+    """One candidate's independent standing in one pillar, for the API."""
+    data = (pillar_ranks or {}).get(pillar) or {}
+    overall = data.get('overall') or {}
+    by_department = data.get('department') or {}
+    department_totals = data.get('department_totals') or {}
+    department_ranks = by_department.get(department or '') or {}
+    return {
+        'score': (data.get('scores') or {}).get(key) if key is not None else None,
+        'rank': overall.get(key) if key is not None else None,
+        'total': data.get('total', 0),
+        'department_rank': department_ranks.get(key) if key is not None else None,
+        'department_total': department_totals.get(department or '', 0),
+    }
 
 
 def _serialize_components(components):
@@ -1560,6 +1848,11 @@ def _profile_ranks(profile):
     engagement signal are ranked, but the totals reflect the college's full roll
     so the rank reads against the whole student body ("#1 of 49").
 
+    ``pillars`` carries the two *independent* standings — mock interview and
+    self-training — each ranked over its own cohort, so the UI can show what a
+    candidate actually did in mocks without it being blurred together with (or
+    read as) their self-training number.
+
     The values are computed and persisted onto the profile row (via
     :func:`_refresh_readiness_college`) so the database always holds the
     current numbers; what is returned here mirrors exactly what was saved.
@@ -1571,14 +1864,17 @@ def _profile_ranks(profile):
         'total': 0,
         'department_total': 0,
         'components': None,
+        'pillars': {
+            pillar: _pillar_rank_payload({}, pillar, None) for pillar in PERF_RANKED_PILLARS
+        },
     }
     if profile is None:
         return empty
     if not profile.college_id:
         return empty
 
-    score_map, overall_ranks, department_ranks, totals = _refresh_readiness_college(
-        college_id=profile.college_id,
+    score_map, overall_ranks, department_ranks, totals, pillar_ranks = (
+        _refresh_readiness_college(college_id=profile.college_id)
     )
     own_key = str(profile.candidate_id)
     dept_ranks = (
@@ -1593,6 +1889,12 @@ def _profile_ranks(profile):
         'total': totals['overall_total'],
         'department_total': totals['department_totals'].get(profile.department or '', 0),
         'components': score_map.get(own_key),
+        'pillars': {
+            pillar: _pillar_rank_payload(
+                pillar_ranks, pillar, own_key, profile.department or '',
+            )
+            for pillar in PERF_RANKED_PILLARS
+        },
     }
 
 
@@ -1605,7 +1907,35 @@ REFRESH_READINESS_FIELDS = (
     'readiness_department_total',
     'readiness_components',
     'readiness_updated_at',
+    'mock_interview_score',
+    'mock_interview_rank',
+    'mock_interview_total',
+    'mock_interview_department_rank',
+    'mock_interview_department_total',
+    'self_training_score',
+    'self_training_rank',
+    'self_training_total',
+    'self_training_department_rank',
+    'self_training_department_total',
 )
+
+# pillar -> the CandidateProfile attributes that hold its independent standing.
+PILLAR_PROFILE_FIELDS = {
+    'mock_interview': (
+        'mock_interview_score',
+        'mock_interview_rank',
+        'mock_interview_total',
+        'mock_interview_department_rank',
+        'mock_interview_department_total',
+    ),
+    'self_training': (
+        'self_training_score',
+        'self_training_rank',
+        'self_training_total',
+        'self_training_department_rank',
+        'self_training_department_total',
+    ),
+}
 
 
 def _refresh_readiness_college(college_id=None, profiles=None, persist=True):
@@ -1618,18 +1948,24 @@ def _refresh_readiness_college(college_id=None, profiles=None, persist=True):
 
     ``profiles`` may be passed to avoid re-fetching when the caller already
     holds the rows; otherwise all profiles of ``college_id`` are loaded.
-    Returns ``(score_map, overall_ranks, department_ranks, totals)`` where
-    ``totals`` is ``{'overall_total': n, 'department_totals': {dept: n}}`` and
-    counts the *full roll* of the college (every candidate profile), so the
-    AIR denominator shows the whole college even though only candidates with
-    engagement receive a score and rank.
+    Returns ``(score_map, overall_ranks, department_ranks, totals,
+    pillar_ranks)`` where ``totals`` is ``{'overall_total': n,
+    'department_totals': {dept: n}}`` and counts the *full roll* of the college
+    (every candidate profile), so the AIR denominator shows the whole college
+    even though only candidates with engagement receive a score and rank;
+    ``pillar_ranks`` is the independent per-pillar ranking from
+    :func:`_pillar_ranks`.
     """
     profiles = list(profiles) if profiles is not None else list(
         CandidateProfile.objects.filter(college_id=college_id)
     )
     if not profiles:
-        return {}, {}, {}, {'overall_total': 0, 'department_totals': {}}
+        return (
+            {}, {}, {}, {'overall_total': 0, 'department_totals': {}},
+            {pillar: {} for pillar in PERF_RANKED_PILLARS},
+        )
     score_map, overall_ranks, department_ranks = _readiness_rankings(profiles)
+    pillar_ranks = _pillar_ranks(profiles, score_map)
     college_total = len(profiles)
     dept_counts = Counter(p.department or '' for p in profiles)
     totals = {
@@ -1657,8 +1993,18 @@ def _refresh_readiness_college(college_id=None, profiles=None, persist=True):
             )
             profile.readiness_components = _serialize_components(components) or {}
             profile.readiness_updated_at = now
+            for pillar, (score_field, rank_field, total_field,
+                         dept_rank_field, dept_total_field) in PILLAR_PROFILE_FIELDS.items():
+                standing = _pillar_rank_payload(
+                    pillar_ranks, pillar, key, profile.department or '',
+                )
+                setattr(profile, score_field, standing['score'])
+                setattr(profile, rank_field, standing['rank'])
+                setattr(profile, total_field, standing['total'])
+                setattr(profile, dept_rank_field, standing['department_rank'])
+                setattr(profile, dept_total_field, standing['department_total'])
         CandidateProfile.objects.bulk_update(profiles, REFRESH_READINESS_FIELDS)
-    return score_map, overall_ranks, department_ranks, totals
+    return score_map, overall_ranks, department_ranks, totals, pillar_ranks
 
 
 def _refresh_candidate_readiness(profile):
@@ -1721,7 +2067,10 @@ PROFILE_CHOICE_FIELDS = {
 PROFILE_INT_FIELDS = ['start_year', 'end_year']
 PROFILE_DECIMAL_FIELDS = ['cgpa', 'expected_ctc']
 PROFILE_DATE_FIELDS = ['date_of_birth']
-PROFILE_BOOL_FIELDS = ['placement_eligible']
+# Intentionally empty: placement_eligible used to be the only boolean the AI
+# could write, and it is now a nullable staff override driven by the readiness
+# score. Keeping it here would let the AI pin a student's eligibility forever.
+PROFILE_BOOL_FIELDS: list = []
 PROFILE_LIST_FIELDS_UPDATE = [
     'skills', 'certifications', 'projects', 'internships',
     'preferred_roles', 'preferred_locations',
@@ -1775,8 +2124,8 @@ def _update_profile_tool_declaration():
                         + '. Values: strings and numbers for the matching '
                         'fields; start_year/end_year as integer years; '
                         'date_of_birth as "YYYY-MM-DD"; gender/placement_status '
-                        'as one of the fixed choices; placement_eligible as a '
-                        'boolean; list fields (skills, certifications, projects, '
+                        'as one of the fixed choices; list fields (skills, '
+                        'certifications, projects, '
                         'internships, preferred_roles, '
                         'preferred_locations) as an ARRAY of strings â€” provide '
                         'the COMPLETE desired list (fetch current values first '
@@ -2389,18 +2738,151 @@ _GD_CRITERION_COLUMN_BY_LABEL = {
     'Build / Challenge': 'build_challenge',
 }
 
+# The student's own lines in a GD round needed before the round is scored at
+# all. Below this the round is still saved (so its topic is not reused) but
+# stays at 0, which keeps it out of the self-training pillar entirely.
+GD_MIN_USER_TURNS = 3
+
+GD_ASSESSMENT_PROMPT = (
+    'You are the assessor for a college group discussion (GD) in TalentBro, an AI '
+    'placement-practice coach for Indian students.\n\n'
+    'Topic: "{topic}"\n\n'
+    'The full discussion transcript is below. Every line is prefixed with the '
+    'speaker name; the student\'s own lines are marked " (your point)".\n\n'
+    '{transcript}\n\n'
+    'Judge ONLY the student, using ONLY what they actually said in this transcript. '
+    'The AI panelists are context, not candidates — never score them, and never let '
+    'their points count for or against the student.\n'
+    'Score these criteria, each 0-100, and include a criterion ONLY if the transcript '
+    'shows the student actually did something on it — otherwise leave it out entirely '
+    'rather than scoring it zero:\n'
+    '{criteria}\n\n'
+    'Be moderate and calibrated: a solid contribution sits around 55-70, a clearly '
+    'strong one around 75-85, and 90+ is reserved for exceptional. Do not reward '
+    'participation alone — the content and the way it was argued are what count.\n\n'
+    'Return ONLY JSON with this exact shape:\n'
+    '{{"criteria": {{"Content Quality": {{"score": number, "evidence": string}}, ...}}, '
+    '"summary": string, "strengths": [string], "improvement_areas": [string]}}\n'
+    '"evidence" is a short quote of what the student said that justifies the score. '
+    '"summary" is 2-3 plain sentences on how the student performed. "strengths" and '
+    '"improvement_areas" are short lists of at most 3 items each.'
+)
+
+
+def _gd_student_turns(transcript_rows):
+    """The student's own lines in a saved GD transcript."""
+    return [
+        row for row in transcript_rows
+        if row.get('role') == 'user' and str(row.get('content') or '').strip()
+    ]
+
+
+def _gd_grade(score):
+    if score >= 85:
+        return 'Excellent'
+    if score >= 70:
+        return 'Good'
+    if score >= 50:
+        return 'Average'
+    return 'Needs work'
+
+
+def _gd_score_round(topic, transcript_rows, student, user=None):
+    """Score a finished GD round from its transcript, server-side.
+
+    The round is the only source of truth: the client's own numbers are never
+    trusted, because a browser-invented score would end up in the student's
+    self-training rank. Returns
+    ``{'scores': {column: 0-100}, 'overall': 0-100, 'summary': str,
+    'strengths': [...], 'improvement_areas': [...]}`` or None when the round
+    carried too little of the student's own words (or Gemini failed), in which
+    case the caller must leave the round unscored.
+    """
+    student_lines = _gd_student_turns(transcript_rows)
+    if len(student_lines) < GD_MIN_USER_TURNS:
+        logger.info(
+            'GD round left unscored — only %d student lines (need %d).',
+            len(student_lines), GD_MIN_USER_TURNS,
+        )
+        return None
+
+    criteria_block = '\n'.join(
+        f'- {label}: {_GD_CRITERION_COLUMN_BY_LABEL[label]} — judge only from the '
+        'student\'s own lines.'
+        for label in _GD_CRITERION_COLUMN_BY_LABEL
+    )
+    prompt = (
+        GD_ASSESSMENT_PROMPT
+        .replace('{topic}', topic or 'the group discussion topic')
+        .replace(
+            '{transcript}',
+            _gd_transcript_block([
+                {
+                    'name': row.get('speaker') or student,
+                    'content': row.get('content'),
+                }
+                for row in transcript_rows
+            ], student),
+        )
+        .replace('{criteria}', criteria_block)
+    )
+    contents = [{
+        'role': 'user',
+        'parts': [{'text': 'Assess this student\'s GD performance.'}],
+    }]
+
+    obj = _model_json(contents, prompt, temperature=0.3, user=user)
+    if not isinstance(obj, dict):
+        return None
+
+    raw = obj.get('criteria') if isinstance(obj.get('criteria'), dict) else {}
+    scores = {}
+    for label, column in _GD_CRITERION_COLUMN_BY_LABEL.items():
+        entry = raw.get(label)
+        if not isinstance(entry, dict):
+            continue
+        grounding = str(entry.get('evidence') or '').strip()
+        if not grounding or not _has_evidence(grounding):
+            continue
+        scores[column] = max(0, min(100, _as_int(entry.get('score'), 0)))
+    if len(scores) < 3:
+        logger.info(
+            'GD round left unscored — only %d of %d criteria could be grounded.',
+            len(scores), len(_GD_CRITERION_COLUMN_BY_LABEL),
+        )
+        return None
+
+    return {
+        'scores': scores,
+        'overall': round(sum(scores.values()) / len(scores)),
+        'summary': str(obj.get('summary') or '').strip(),
+        'strengths': [
+            str(item).strip() for item in (obj.get('strengths') or []) if str(item).strip()
+        ][:3],
+        'improvement_areas': [
+            str(item).strip()
+            for item in (obj.get('improvement_areas') or [])
+            if str(item).strip()
+        ][:3],
+    }
+
 
 def gd_complete(request):
-    """Persist a finished GD round — even a near-empty one.
+    """Persist a finished GD round and score it from its own transcript.
 
     Every round is saved whether or not the student spoke and however short it
     ran, so the saved topic list (used by :func:`gd_topic` to avoid repeats) is
     always complete.
 
+    The scores are computed HERE, from the transcript, and the client's own
+    numbers are ignored: a browser that invents ``58 + 3 per message`` would
+    otherwise land straight in the student's self-training rank. A round the
+    student barely spoke in is saved unscored (all zeros), which also keeps it
+    out of the self-training pillar, and no score notification is sent for it.
+
     Body: ``{topic, participants: [{name, gender, is_user}], transcript:
-    [{name, content, from}], result: {criteria: [{label, score}], overall,
-    grade, strengths, improvementAreas}}`` where ``from`` is ``"you"`` for the
-    student's lines.
+    [{name, content, from}]}`` where ``from`` is ``"you"`` for the student's
+    lines. Responds with the saved round so the client renders the real scores.
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
@@ -2426,43 +2908,38 @@ def gd_complete(request):
             'content': content,
         })
 
-    result = data.get('result') if isinstance(data.get('result'), dict) else {}
-    criteria = result.get('criteria') if isinstance(result.get('criteria'), list) else []
-    scores = {
-        'content_quality': 0,
-        'reasoning': 0,
-        'communication': 0,
-        'confidence': 0,
-        'teamwork': 0,
-        'initiative': 0,
-        'active_listening': 0,
-        'build_challenge': 0,
-    }
-    for item in criteria:
-        if not isinstance(item, dict):
-            continue
-        label = str(item.get('label') or '').strip()
-        column = _GD_CRITERION_COLUMN_BY_LABEL.get(label)
-        if not column or column not in scores:
-            continue
-        try:
-            score = max(0, min(100, int(round(float(item.get('score'))))))
-        except (TypeError, ValueError):
-            continue
-        scores[column] = score
-
-    overall = result.get('overall') or 0
-    try:
-        overall = max(0, min(100, int(round(float(overall)))))
-    except (TypeError, ValueError):
-        overall = 0
-    grade = str(result.get('grade') or '')[:10]
-    strengths = result.get('strengths') if isinstance(result.get('strengths'), list) else []
-    improvement_areas = (
-        result.get('improvementAreas') if isinstance(result.get('improvementAreas'), list) else []
+    user_name = request.user.get_full_name() or request.user.username
+    student_name = next(
+        (
+            str(p.get('name') or '').strip()
+            for p in (data.get('participants') or [])
+            if isinstance(p, dict) and p.get('is_user') and str(p.get('name') or '').strip()
+        ),
+        user_name,
     )
 
-    user_name = request.user.get_full_name() or request.user.username
+    assessment = None
+    try:
+        assessment = _gd_score_round(
+            topic, transcript_rows, student_name, user=request.user,
+        )
+    except Exception:
+        logger.exception('GD assessment failed for topic %s.', topic[:60])
+
+    scores = {column: 0 for column in _GD_CRITERION_COLUMN_BY_LABEL.values()}
+    overall = 0
+    grade = ''
+    summary = ''
+    strengths = []
+    improvement_areas = []
+    if assessment:
+        scores.update(assessment['scores'])
+        overall = assessment['overall']
+        grade = _gd_grade(overall)
+        summary = assessment['summary']
+        strengths = assessment['strengths']
+        improvement_areas = assessment['improvement_areas']
+
     participant_list = []
     for entry in (data.get('participants') or [])[:8]:
         if not isinstance(entry, dict):
@@ -2499,22 +2976,28 @@ def gd_complete(request):
         build_challenge=scores['build_challenge'],
         overall_score=overall,
         grade=grade,
-        strengths=[str(s) for s in strengths[:4]],
-        improvement_areas=[str(s) for s in improvement_areas[:4]],
+        overall_summary=summary,
+        strengths=strengths,
+        improvement_areas=improvement_areas,
+        assessment=assessment or {},
     )
     try:
-        _push_personal_notification(
-            request.user,
-            f'gd:{gd.pk}',
-            'Group Discussion: Complete',
-            f'Your group discussion round was scored at {overall}/100. '
-            'Tap to open your full analysis.',
-            f'/gd-report/{gd.pk}',
-        )
+        if overall > 0:
+            _push_personal_notification(
+                request.user,
+                f'gd:{gd.pk}',
+                'Group Discussion: Complete',
+                f'Your group discussion round was scored at {overall}/100. '
+                'Tap to open your full analysis.',
+                f'/gd-report/{gd.pk}',
+            )
     except Exception:
         logger.exception('GD completion notification failed for %s', gd.pk)
     _refresh_readiness_for_user(request.user)
-    return JsonResponse({'id': str(gd.id)}, status=201)
+    return JsonResponse(
+        {'id': str(gd.id), 'session': _gd_record_payload(gd, include_full=True)},
+        status=201,
+    )
 
 
 # Criterion label -> GdTraining score column order for the history payload,
@@ -2776,7 +3259,6 @@ Rules for values:
 - date_of_birth: ISO date string "YYYY-MM-DD"
 - gender: one of "male", "female", "other", "prefer_not_to_say"
 - placement_status: one of "not_started", "applying", "shortlisted", "placed"
-- placement_eligible: boolean
 - department, program, mobile_number, linkedin_url, github_url, portfolio_url,
   avatar: string
 - skills, certifications, projects, internships,
@@ -2980,6 +3462,321 @@ def refresh_profile_summary(user, session=None):
     }
 
 
+# ---------------------------------------------------------------------------
+# Candidate roadmap — structured placement-prep plan from roadmap chats
+# ---------------------------------------------------------------------------
+
+# Cheap keyword gate: only chats that plausibly discuss a preparation roadmap
+# get sent to Gemini for structured extraction, so unrelated conversations never
+# burn API cost. Matched case-insensitively against the combined transcript.
+ROADMAP_DETECTION_KEYWORDS = (
+    'roadmap', 'road map', 'road-map',
+    'study plan', 'preparation plan', 'prep plan', 'placement plan',
+    'get placed', 'getting placed', 'placed in', 'placed at',
+    'target compan', 'target role', 'dream compan',
+    'placement ready', 'placement prepared', 'placement-ready', 'placement-prepared',
+    'shortlisted in', 'shortlist for',
+    'by the end of this month', 'by next month', 'by december', 'this month',
+)
+
+ROADMAP_MODULES = (
+    'communication', 'english', 'aplr', 'basic_math',
+    'situational', 'technical', 'dsa', 'mock_interview',
+)
+
+
+def _collect_chat_transcript(user, session=None):
+    """Chronological [{role, content}, ...] transcript of the user's chats.
+
+    Includes the session being closed plus any other sessions that ended since
+    the roadmap was last generated. Mirrors the assembly used by
+    :func:`refresh_profile_summary`.
+    """
+    sessions_qs = ChatSession.objects.filter(user=user).order_by('-updated_at')
+    if session is not None:
+        target = ChatSession.objects.filter(pk=session.pk, user=user).first()
+        sessions_qs = sessions_qs.exclude(pk=session.pk)
+        all_sessions = ([target] if target else []) + list(sessions_qs)
+    else:
+        all_sessions = list(sessions_qs)
+
+    transcript = []
+    for s in all_sessions:
+        messages = s.messages.order_by('created_at')
+        if not messages.exists():
+            continue
+        for msg in messages:
+            transcript.append({'role': msg.role, 'content': msg.content})
+    return transcript
+
+
+def _roadmap_detected(transcript):
+    """Cheap heuristic: does any transcript turn look like a roadmap chat?"""
+    haystack = ' '.join(
+        str(entry.get('content') or '') for entry in (transcript or [])
+    ).lower()
+    if not haystack:
+        return False
+    return any(keyword in haystack for keyword in ROADMAP_DETECTION_KEYWORDS)
+
+
+ROADMAP_EXTRACTION_PROMPT = """You are TalentBro, an AI placement-prep coach. A candidate
+finished a chat session where they discussed their placement-preparation roadmap.
+
+Below is the candidate's CURRENT stored profile (JSON), their self-training
+history (read-only reference), their CURRENT stored roadmap (JSON, may be
+empty), and the full chat transcript (JSON array of {role, content}).
+
+Your job: detect whether this conversation is really about building or refining
+a preparation roadmap, and if so produce a COMPREHENSIVE, structured roadmap.
+
+Rules:
+- Only extract what the candidate actually expressed. Never invent goals,
+  companies, dates or targets the candidate did not mention.
+- Timeline target: capture the date or month the candidate wants to be ready by
+  (e.g. "by the end of this month", "by December 2026", "before TCS drive",
+  "by 30 November 2026"). Put the verbatim/paraphrased goal in
+  "timeline_target". If it maps to a concrete calendar day, also give
+  "target_date" as an ISO "YYYY-MM-DD" string; otherwise null.
+- Company target: the companies/roles the candidate says they want to get
+  placed in (e.g. TCS, Accenture). One or several. Empty array if none stated.
+- "goal_statement": a clean one-sentence paraphrase of the overall goal.
+- "mocks_required": how many mock interviews the candidate should take based on
+  how far they are from the target (1-6). Use the conversation's intent and their
+  readiness; 0 only when the transcript genuinely gives no signal.
+- "daily_practice_session_duration": recommended minutes per day (20-240),
+  inferred from the timeline tightness and the candidate's stated availability.
+- "self_training_required": for EVERY module below, say whether it is required
+  for this candidate, how many sessions per week, and which specific focus areas
+  to drill based on their profile and what they discussed:
+  communication, english, aplr, basic_math, situational, technical, dsa,
+  mock_interview. Use 0 sessions_per_week when a module is not required.
+- "roadmap.phases": 2-6 phased periods (e.g. "Week 1-2") with a focus, the
+  modules/topics to practise in that phase, and concrete goals.
+- "roadmap.weekly_schedule": a realistic weekly breakdown the candidate can
+  follow (days, practice blocks, mocks, mock interview slots).
+- "summary": a 2-4 sentence natural-language summary of the generated roadmap.
+- If the chat is NOT a roadmap discussion, return is_roadmap_discussion=false
+  and null/empty values everywhere else.
+
+Reply with STRICT JSON only — no prose, no markdown, no code fences — matching
+exactly this schema:
+{
+  "is_roadmap_discussion": true,
+  "timeline_target": "<string>",
+  "target_date": "YYYY-MM-DD or null",
+  "company_target": ["<Company>"],
+  "goal_statement": "<string>",
+  "mocks_required": <int>,
+  "daily_practice_session_duration": <int>,
+  "self_training_required": {
+    "communication": {"required": true, "sessions_per_week": <int>, "focus_areas": ["..."]},
+    "english": {"required": true, "sessions_per_week": <int>, "focus_areas": ["..."]},
+    "aplr": {"required": true, "sessions_per_week": <int>, "focus_areas": ["..."]},
+    "basic_math": {"required": true, "sessions_per_week": <int>, "focus_areas": ["..."]},
+    "situational": {"required": true, "sessions_per_week": <int>, "focus_areas": ["..."]},
+    "technical": {"required": true, "sessions_per_week": <int>, "focus_areas": ["..."]},
+    "dsa": {"required": true, "sessions_per_week": <int>, "focus_areas": ["..."]},
+    "mock_interview": {"required": true, "sessions_per_week": <int>, "focus_areas": ["..."]}
+  },
+  "roadmap": {
+    "phases": [
+      {"period": "Week 1-2", "focus": "...", "modules": ["..."], "goals": ["..."]}
+    ],
+    "weekly_schedule": {
+      "monday": ["..."],
+      "tuesday": ["..."],
+      "wednesday": ["..."],
+      "thursday": ["..."],
+      "friday": ["..."],
+      "saturday": ["..."],
+      "sunday": ["..."]
+    }
+  },
+  "summary": "<string>"
+}
+"""
+
+
+def _normalize_roadmap_payload(result):
+    """Coerce the raw model output into clean values for the DB row."""
+    def to_int(value, default=0):
+        try:
+            return max(0, int(float(value)))
+        except (TypeError, ValueError):
+            return default
+
+    def to_str(value, default=''):
+        return str(value or '').strip() or default
+
+    def to_list(value):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        return []
+
+    self_training = result.get('self_training_required') or {}
+    if not isinstance(self_training, dict):
+        self_training = {}
+    normalized_modules = {}
+    for module in ROADMAP_MODULES:
+        entry = self_training.get(module)
+        if not isinstance(entry, dict):
+            entry = {}
+        normalized_modules[module] = {
+            'required': bool(entry.get('required', False)),
+            'sessions_per_week': to_int(entry.get('sessions_per_week')),
+            'focus_areas': to_list(entry.get('focus_areas')),
+        }
+
+    roadmap = result.get('roadmap') or {}
+    if not isinstance(roadmap, dict):
+        roadmap = {}
+
+    target_date = None
+    raw_date = to_str(result.get('target_date'), '').strip() or None
+    if raw_date:
+        parsed = parse_date(raw_date)
+        if parsed:
+            target_date = parsed
+
+    return {
+        'timeline_target': to_str(result.get('timeline_target')),
+        'target_date': target_date,
+        'company_target': to_list(result.get('company_target')),
+        'goal_statement': to_str(result.get('goal_statement')),
+        'mocks_required': to_int(result.get('mocks_required')),
+        'daily_practice_session_duration': to_int(result.get('daily_practice_session_duration')),
+        'self_training_required': normalized_modules,
+        'roadmap': roadmap,
+        'summary': to_str(result.get('summary')),
+    }
+
+
+def build_candidate_roadmap(user, session=None):
+    """Detect roadmap discussions in chat history, ask Gemini for a structured
+    roadmap, and upsert it onto the candidate's single ``CandidateRoadmap`` row.
+
+    Best-effort and idempotent: returns ``None`` (and leaves any existing row
+    untouched) when there is nothing to process or the model fails. One row per
+    candidate — later roadmap chats refine that row in place.
+    """
+    profile = getattr(user, 'candidate_profile', None)
+    if profile is None:
+        return None
+
+    transcript = _collect_chat_transcript(user, session)
+    if not transcript:
+        print('[candidate_roadmap] NO transcript (empty chat history)')
+        return None
+
+    if not _roadmap_detected(transcript):
+        print('[candidate_roadmap] skipped — no roadmap keywords in transcript')
+        return None
+
+    existing = None
+    try:
+        existing = user.candidate_roadmap
+    except CandidateRoadmap.DoesNotExist:
+        existing = None
+
+    snapshot = _profile_snapshot(profile)
+    self_training_ctx = _self_training_context(user) or (
+        'The student has no self-training history yet.'
+    )
+    existing_payload = {}
+    if existing is not None:
+        existing_payload = _roadmap_payload(existing) if existing else {}
+
+    messages = [
+        {
+            'role': 'user',
+            'parts': [{'text': (
+                f'CURRENT_PROFILE_JSON:\n{json.dumps(snapshot, indent=2)}\n\n'
+                f'SELF_TRAINING_REFERENCE:\n{self_training_ctx}\n\n'
+                f'CURRENT_ROADMAP_JSON:\n{json.dumps(existing_payload, indent=2)}\n\n'
+                f'CHAT_TRANSCRIPT_JSON:\n{json.dumps(transcript, indent=2)}'
+            )}],
+        },
+    ]
+    result = _model_json(messages, ROADMAP_EXTRACTION_PROMPT, temperature=0.2, user=user)
+    if not isinstance(result, dict):
+        print('[candidate_roadmap] NO — Gemini returned invalid/non-JSON', repr(result))
+        return None
+
+    if result.get('is_roadmap_discussion') is not True:
+        print('[candidate_roadmap] no roadmap discussion detected in transcript')
+        return None
+
+    payload = _normalize_roadmap_payload(result)
+    roadmap_obj, created = CandidateRoadmap.objects.update_or_create(
+        user=user,
+        defaults={
+            'source_session': session,
+            'status': ROADMAP_STATUS_ACTIVE,
+            'timeline_target': payload['timeline_target'],
+            'target_date': payload['target_date'],
+            'company_target': payload['company_target'],
+            'goal_statement': payload['goal_statement'],
+            'mocks_required': payload['mocks_required'],
+            'daily_practice_session_duration': payload['daily_practice_session_duration'],
+            'self_training_required': payload['self_training_required'],
+            'roadmap': payload['roadmap'],
+            'summary': payload['summary'],
+        },
+    )
+    out = {
+        'roadmap_id': str(roadmap_obj.pk),
+        'created': created,
+        'timeline_target': payload['timeline_target'],
+        'company_target': payload['company_target'],
+        'mocks_required': payload['mocks_required'],
+    }
+    print('[candidate_roadmap]', 'created' if created else 'updated',
+          '—', out['timeline_target'] or 'no timeline', '/',
+          ','.join(out['company_target']) or 'no companies')
+    return out
+
+
+def _roadmap_payload(obj):
+    """Plain-dict serialization of a CandidateRoadmap row (API + model context)."""
+    return {
+        'status': obj.status,
+        'timeline_target': obj.timeline_target or '',
+        'target_date': obj.target_date.isoformat() if obj.target_date else None,
+        'company_target': list(obj.company_target or []),
+        'goal_statement': obj.goal_statement or '',
+        'mocks_required': obj.mocks_required,
+        'daily_practice_session_duration': obj.daily_practice_session_duration,
+        'self_training_required': dict(obj.self_training_required or {}),
+        'roadmap': dict(obj.roadmap or {}),
+        'summary': obj.summary or '',
+    }
+
+
+@require_GET
+def candidate_roadmap(request):
+    """Return the signed-in candidate's current structured roadmap."""
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    roadmap_obj = CandidateRoadmap.objects.filter(user=request.user).first()
+    if roadmap_obj is None:
+        return JsonResponse({'detail': 'No roadmap yet.'}, status=404)
+
+    payload = _roadmap_payload(roadmap_obj)
+    payload['id'] = str(roadmap_obj.pk)
+    payload['source_session'] = (
+        str(roadmap_obj.source_session_id) if roadmap_obj.source_session_id else None
+    )
+    payload['created_at'] = roadmap_obj.created_at.isoformat()
+    payload['updated_at'] = roadmap_obj.updated_at.isoformat()
+    return JsonResponse({'roadmap': payload})
+
+
+
+
 def _training_sources_label(source):
     """Human-readable label for a profile-update source used in summaries."""
     return {
@@ -3106,6 +3903,10 @@ def _candidate_profile_data(profile):
     if profile is None:
         return None
     return {
+        # The candidate's own profile id. Clients need it to scope per-candidate
+        # screens (e.g. /student-message) to the signed-in viewer rather than to
+        # whoever they happen to be looking at.
+        'candidate_id': str(profile.candidate_id),
         'phone': profile.mobile_number,
         'date_of_birth': (
             profile.date_of_birth.isoformat() if profile.date_of_birth else None
@@ -3135,8 +3936,11 @@ def _candidate_profile_data(profile):
         'time_spent': int(profile.time_spent),
         'personal_email': profile.personal_email,
         'avatar': profile.avatar,
+        'bio': profile.bio,
         'placement_status': profile.placement_status,
-        'placement_eligible': profile.placement_eligible,
+        # Resolved through the readiness rule; see _effective_eligible.
+        'placement_eligible': _effective_eligible(profile),
+        'placement_eligible_override': profile.placement_eligible,
         'cost_incurred': float(profile.cost_incurred),
         'first_name': profile.first_name,
         'middle_name': profile.middle_name,
@@ -3174,6 +3978,152 @@ def _profile_payload(user, profile):
     }
 
 
+_LINKEDIN_IN_RE = re.compile(r'linkedin\.com/(in|pub)/[\w./\-]+', re.IGNORECASE)
+
+# Matches CandidateProfile.bio. LinkedIn caps a headline at 220 characters; this
+# leaves headroom and stops a long scrape from being stored whole.
+MAX_BIO_LENGTH = 500
+
+# The actor spells the professional headline "headline"; the other two are the
+# names sibling LinkedIn scrapers use for the same line, checked in order so a
+# change of actor does not silently empty everyone's bio.
+_LINKEDIN_HEADLINE_KEYS = ('headline', 'subtitle', 'tagline')
+
+
+def get_linkedin_profile(linkedin_url):
+    """Fetch a LinkedIn profile's photo and headline via the Apify scraper.
+
+    Returns ``(avatar_url, headline, error)``. On success the error is None and
+    either value may still be an empty string, since a profile can have a photo
+    with no headline or the other way round. On failure the error explains why
+    and the caller should carry on: a missing photo or headline is never worth
+    failing a profile save over.
+    """
+    token = settings.APIFY_TOKEN
+    if not token:
+        return None, None, "APIFY_TOKEN is not configured. Set it in the Backend/.env file."
+
+    try:
+        response = requests.post(
+            "https://api.apify.com/v2/acts/"
+            "calm_builder~linkedin-profile-scraper/"
+            "run-sync-get-dataset-items",
+            params={'token': token},
+            json={'profiles': [linkedin_url]},
+            timeout=60,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return None, None, f'Apify request failed: {exc}'
+
+    try:
+        data = response.json()
+    except ValueError:
+        return None, None, 'Apify returned a response that was not JSON.'
+
+    # The endpoint returns the dataset items as a list, but an error envelope
+    # with a 200 status comes back as a dict, so only a list of results is usable.
+    if not isinstance(data, list):
+        return None, None, 'Apify returned no data for that LinkedIn profile.'
+    if not data:
+        return None, None, 'Apify returned no data for that LinkedIn profile.'
+    if not isinstance(data[0], dict):
+        return None, None, 'Apify returned no data for that LinkedIn profile.'
+
+    item = data[0]
+    avatar_url = str(item.get('profilePictureUrl') or '').strip()
+    headline = ''
+    for key in _LINKEDIN_HEADLINE_KEYS:
+        headline = str(item.get(key) or '').strip()
+        if headline:
+            break
+
+    if not avatar_url and not headline:
+        return (
+            None,
+            None,
+            'Apify returned a result but no profilePictureUrl or headline.',
+        )
+
+    return avatar_url or None, headline or None, None
+
+
+def _enrich_profile_from_linkedin(profile):
+    """Refresh the candidate's photo and bio from their LinkedIn profile.
+
+    Called after the LinkedIn URL is set, from both onboarding and the profile
+    editor. Only fields that actually changed are written, so re-running it
+    cannot wipe a photo the candidate uploaded themselves, and a scrape failure
+    leaves the profile exactly as it was. Returns the changed field names, so
+    the caller can report what happened.
+    """
+    if not profile.linkedin_url:
+        return []
+
+    avatar_url, headline, _error = get_linkedin_profile(profile.linkedin_url)
+
+    changed = []
+    if avatar_url and profile.avatar != avatar_url:
+        profile.avatar = avatar_url
+        changed.append('avatar')
+    bio = (headline or '').strip()[:MAX_BIO_LENGTH]
+    if bio and profile.bio != bio:
+        profile.bio = bio
+        changed.append('bio')
+
+    if changed:
+        profile.save(update_fields=[*changed, 'updated_at'])
+    return changed
+
+
+@require_POST
+def linkedin_profile_fetch(request):
+    """Fetch the photo and headline for a LinkedIn profile link.
+
+    Expects ``{"linkedin_url": "https://www.linkedin.com/in/<id>"}`` and returns
+    ``{"ok": true, "avatar_url": "...", "bio": "..."}``. When ``save`` is true
+    (default) both are stored on the candidate's profile.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    data = _json_body(request)
+    if data is None:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    linkedin_url = str(data.get('linkedin_url') or data.get('url') or '').strip()
+    if not linkedin_url:
+        return JsonResponse({'detail': 'linkedin_url is required.'}, status=400)
+    if not _LINKEDIN_IN_RE.search(linkedin_url):
+        return JsonResponse(
+            {'ok': False, 'detail': 'That does not look like a LinkedIn profile link.'},
+            status=400,
+        )
+
+    avatar_url, headline, error = get_linkedin_profile(linkedin_url)
+    if error is not None and not avatar_url and not headline:
+        return JsonResponse({'ok': False, 'detail': error}, status=400)
+
+    bio = (headline or '').strip()[:MAX_BIO_LENGTH]
+    saved = False
+    if bool(data.get('save', True)):
+        profile, _created = CandidateProfile.objects.get_or_create(user=request.user)
+        changed = []
+        if avatar_url and profile.avatar != avatar_url:
+            profile.avatar = avatar_url
+            changed.append('avatar')
+        if bio and profile.bio != bio:
+            profile.bio = bio
+            changed.append('bio')
+        if changed:
+            profile.save(update_fields=[*changed, 'updated_at'])
+        saved = bool(changed)
+
+    return JsonResponse(
+        {'ok': True, 'saved': saved, 'avatar_url': avatar_url, 'bio': bio}
+    )
+
+
 @require_http_methods(["GET", "PATCH"])
 def candidate_profile(request):
     """Self-serve student/candidate profile (candidate == student)."""
@@ -3189,6 +4139,7 @@ def candidate_profile(request):
         return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
 
     profile, _ = CandidateProfile.objects.get_or_create(user=request.user)
+    prev_linkedin_url = profile.linkedin_url
 
     if 'college' in data:
         profile.college = _resolve_institution(str(data['college'] or '').strip())
@@ -3249,10 +4200,6 @@ def candidate_profile(request):
             profile.gender = clean
         elif payload_field == 'preferred_language':
             profile.preferred_language = _normalize_language_name(value)
-        elif payload_field == 'placement_eligible':
-            if value is None:
-                continue
-            profile.placement_eligible = bool(value)
         else:
             setattr(profile, model_field, str(value or '').strip())
 
@@ -3266,6 +4213,18 @@ def candidate_profile(request):
             setattr(profile, field, value)
 
     profile.save()
+
+    # Pull the photo and headline from LinkedIn when the candidate saves a
+    # LinkedIn URL, or when either is still missing, so the profile picks itself
+    # up from LinkedIn without the candidate having to fill it in by hand. The
+    # bio is only overwritten when LinkedIn actually returns a headline, so a
+    # candidate's own wording survives a scrape that comes back empty.
+    if (
+        'linkedin_url' in data
+        and profile.linkedin_url
+        and (profile.linkedin_url != prev_linkedin_url or not profile.avatar or not profile.bio)
+    ):
+        _enrich_profile_from_linkedin(profile)
 
     if 'name' in data and not ('first_name' in data or 'last_name' in data or 'middle_name' in data):
         name = str(data.get('name') or '').strip()
@@ -9255,6 +10214,12 @@ def chat_summarize(request):
         logger.exception('Profile summary refresh failed.')
         return JsonResponse({'detail': 'Summary refresh failed.'}, status=500)
 
+    try:
+        build_candidate_roadmap(request.user, session)
+    except Exception:
+        # A roadmap build failure must never break the session-end flow.
+        logger.exception('Candidate roadmap build failed.')
+
     _refresh_readiness_for_user(request.user)
 
     if result is None:
@@ -9302,6 +10267,11 @@ def chat_session_detail(request, session_id):
         except Exception:
             # Profile summarisation must never break session deletion.
             logger.exception('Profile summary refresh failed during session delete.')
+        try:
+            build_candidate_roadmap(request.user, session)
+        except Exception:
+            # Roadmap building must never break session deletion either.
+            logger.exception('Candidate roadmap build failed during session delete.')
         session.delete()
         _refresh_readiness_for_user(request.user)
         return JsonResponse({'ok': True})
@@ -10041,6 +11011,12 @@ def _persist_onboarding(user, profile_data, messages):
     user.save()
     profile.save()
 
+    # Pull the photo and headline from LinkedIn when onboarding provides a
+    # LinkedIn URL, so the profile matches the student's LinkedIn presence
+    # without them having to type a bio.
+    if profile.linkedin_url and (not profile.avatar or not profile.bio):
+        _enrich_profile_from_linkedin(profile)
+
     # Save the onboarding conversation as a normal chat session titled
     # "Student Onboarding" so it becomes the student's first saved chat.
     if isinstance(messages, list) and messages:
@@ -10475,6 +11451,63 @@ def _clamp_panelist(panelist, roster):
     return 'atlas'
 
 
+def _next_mock_speaker(interview, roster):
+    """Choose which panel member asks the next question.
+
+    The model is left to pick a speaker it will happily answer "atlas" every
+    single turn, which turns a panel interview into a monologue. Rotation is
+    therefore decided here from the transcript, so every member the candidate
+    selected actually gets to speak:
+
+    - never the member who just spoke (unless they are the only panel),
+    - otherwise whoever has spoken least often,
+    - breaking ties by whoever spoke longest ago.
+
+    Ties keep the panel's own order, so a freshly-started interview introduces
+    the members in the order the candidate picked them.
+    """
+    if not roster:
+        return 'atlas'
+    if len(roster) == 1:
+        return roster[0]
+    spoken = [
+        m.panelist
+        for m in MockInterviewMessage.objects.filter(interview=interview, role='assistant')
+        .exclude(panelist='')
+        .only('panelist')
+        if m.panelist in roster
+    ]
+    previous = spoken[-1] if spoken else None
+    candidates = [p for p in roster if p != previous] or list(roster)
+
+    def rank(pid):
+        turns = sum(1 for p in spoken if p == pid)
+        last_at = -1
+        for i, p in enumerate(spoken):
+            if p == pid:
+                last_at = i
+        return (turns, last_at)
+
+    return min(candidates, key=rank)
+
+
+def _speaker_instruction(panelist):
+    """Pin the next message to one named panel member.
+
+    Without this the model narrates in its own voice and defaults to the host,
+    so the speaker has to be stated as a hard instruction rather than left as a
+    suggestion.
+    """
+    desc = MOCK_INTERVIEW_PANELISTS.get(panelist, '')
+    who = f'{panelist} ({desc})' if desc else panelist
+    return (
+        '\nSPEAKER FOR THIS TURN\n'
+        f'Only {who} speaks in this message. Write it in that member\'s own voice and from their '
+        'area of focus, building on what the panel has already covered. Do not write lines for '
+        'any other member, do not add a second speaker, and do not mention who is speaking.\n'
+    )
+
+
 def _panel_roster_text(panelist_ids, company_name='this company'):
     text = (
         f'You are the talent panel at {company_name} conducting a mock placement interview. '
@@ -10625,10 +11658,12 @@ MOCK_INTERVIEW_REPLY_PROMPT = (
     'The transcript is provided as conversation history. You (the panel) are aware of every '
     'prior question and answer.\n\n'
     'DECIDING THE NEXT SPEAKER\n'
-    'Choose based on natural flow and topic continuity. If the candidate just described a '
-    'project or experience, the next panelist should almost always continue probing that same '
-    'topic from their angle before anyone switches to a new area. The conversation must chain '
-    'naturally.\n\n'
+    'The panel chair has already decided who speaks this turn - the member named above under '
+    '"SPEAKER FOR THIS TURN". Write that member\'s line and nobody else\'s. If the candidate just '
+    'described a project or experience, that member should almost always continue probing that '
+    'same topic from their angle before anyone switches to a new area. The conversation must chain '
+    'naturally, and different members should take turns so the candidate is talking to a panel '
+    'rather than to one person.\n\n'
     'REACTING TO THE ANSWER\n'
     '1. First react briefly â€” acknowledge a solid point ("Good, that makes sense"), challenge '
     'a weak answer ("I am not convinced â€” what was YOUR part?"), or build on an interesting '
@@ -10687,11 +11722,10 @@ MOCK_INTERVIEW_REPLY_PROMPT = (
     'give warm, concise overall feedback referencing specific things the candidate said, and '
     'clearly end the interview.\n\n'
     'The latest candidate answer is:\n"{answer}"\n\n'
-    'Respond ONLY as JSON: "panelist" (one id from atlas/maya/albert/peter/daniel/ada/carl '
-    'â€” only IDs present in the panel), "text" (the single next message), "done" (true only '
-    'if ending with final feedback, otherwise false), and "tone" (exactly one of "positive", '
-    '"neutral", or "negative" â€” use "negative" for disengaged, uninterested, vague, or '
-    'clearly under-qualified answers).'
+    'Respond ONLY as JSON: "panelist" (exactly the id given under "SPEAKER FOR THIS TURN"), "text" '
+    '(the single next message from that member), "done" (true only if ending with final feedback, '
+    'otherwise false), and "tone" (exactly one of "positive", "neutral", or "negative" — use '
+    '"negative" for disengaged, uninterested, vague, or clearly under-qualified answers).'
 )
 
 
@@ -10706,14 +11740,21 @@ MOCK_INTERVIEW_ANALYSIS_PROMPT = (
     'from the interview transcript below. The dimension scores must reflect what the candidate '
     'actually did in THIS interview and nothing else — do NOT let anything outside this '
     'transcript (profile details, coursework, other practice sessions, self-training scores, '
-    'aptitude or personality modules) influence any score. If the transcript shows no evidence '
-    'for a dimension, score it low (toward 0) and say so in the description. '
-    'Score exactly these {count} dimensions, each on a percentage scale from 0 to 100, '
-    'and for EVERY dimension write a short "description" \u2014 a couple of sentences grounded in '
-    'specific evidence from the transcript \u2014 explaining WHY this candidate earned that score '
-    '(quote or paraphrase what they actually said). Do not invent evidence that is not in the '
-    'transcript.\n'
-    'Dimensions (score every one exactly by this name):\n{dimensions}\n\n'
+    'aptitude or personality modules) influence any score.\n'
+    'Score ONLY the dimensions the candidate actually gave evidence for. If the candidate never '
+    'addressed a dimension, LEAVE IT OUT of "scores" entirely — do not give it a low score and '
+    'do not invent a description for it. A dimension that was not covered is missing data, not a '
+    'failure, and anything you score without a candidate quote behind it will be discarded.\n'
+    'Score each dimension you do include on a percentage scale from 0 to 100, with a short '
+    '"evidence" field holding a short quote (or close paraphrase) of what the candidate actually '
+    'said, and a "description" of a couple of sentences explaining why that evidence earned that '
+    'score.\n'
+    'Be moderate and calibrated: a routine, adequate answer sits around 55-70, a clearly strong '
+    'answer around 75-85, and 90+ is reserved for an outstanding answer. Do not hand out a high '
+    'score for effort alone, and do not punish a candidate for a dimension the panel never gave '
+    'them a chance to cover.\n'
+    'Dimensions you may score (use these exact names, and only the ones the transcript supports):'
+    '\n{dimensions}\n\n'
     'Then produce a SWOT analysis for this candidate based strictly on the interview transcript '
     'above:\n'
     '- "strengths": what they clearly did well, with specific evidence.\n'
@@ -10721,12 +11762,14 @@ MOCK_INTERVIEW_ANALYSIS_PROMPT = (
     '- "opportunities": areas they can realistically turn into strengths or grow into.\n'
     '- "threats": risks that could hurt them in a real placement process.\n\n'
     'Return ONLY JSON with this exact shape:\n'
-    '{{"scores": {{{dimension_name}}: {{"score": number, "description": string}}, ...}}, '
+    '{{"scores": {{{dimension_name}: {{"score": number, "evidence": string, '
+    '"description": string}}, ...}}, '
     ' "swot": {{"strengths": string, "weaknesses": string, "opportunities": string, "threats": string}}}}\n'
-    '"scores" must contain every dimension listed above exactly once, keyed by the exact dimension '
-    'name (e.g. "Communication Skills"), each "score" between 0 and 100. The market has '
-    'dimension names as-is \u2014 do not rename them.'
+    '"scores" may contain fewer dimensions than the list above — omit the ones with no evidence, '
+    'and key the rest by the exact dimension name (e.g. "Communication Skills"). The market has '
+    'dimension names as-is — do not rename them.'
 )
+
 
 
 def _mock_transcript_text(interview):
@@ -10743,14 +11786,28 @@ def _mock_transcript_text(interview):
 
 
 def _mock_analysis_payload(analysis):
-    """Serialize a MockInterviewAnalysis (None-safe) for the API."""
+    """Serialize a MockInterviewAnalysis (None-safe) for the API.
+
+    ``overall_score`` is the moderated score (None when the analysis carries too
+    little evidence to publish one) and ``scored_dimensions`` says how much of
+    the rubric it actually covers, so the client never has to re-derive a number
+    the server already moderated.
+    """
     if analysis is None:
         return None
+    scored = [
+        (getattr(analysis, field), getattr(analysis, f'{field}_desc', ''))
+        for field, _name, _definition in MOCK_INTERVIEW_ANALYSIS_DIMENSIONS
+        if getattr(analysis, f'{field}_desc', '')
+    ]
     return {
         'id': str(analysis.pk),
         'company_name': analysis.company_name,
         'role': analysis.role,
         'created_at': analysis.created_at.isoformat(),
+        'overall_score': _mock_analysis_score(scored),
+        'scored_dimensions': len(scored),
+        'total_dimensions': len(MOCK_INTERVIEW_ANALYSIS_DIMENSIONS),
         'metrics': analysis.metrics,
         'swot': {
             'strengths': analysis.swot_strengths,
@@ -10782,9 +11839,13 @@ def _store_mock_analysis(interview, obj):
 
     The object is expected in the shape returned by ``_model_json`` for
     ``MOCK_INTERVIEW_ANALYSIS_PROMPT``: ``{"scores": {dimension: {"score",
-    "description"}}, "swot": {...}}``. Returns the saved
-    ``MockInterviewAnalysis``, or the existing one (or None) if the output was
-    unusable and nothing should be overwritten.
+    "evidence", "description"}}, "swot": {...}}``.
+
+    A dimension is only stored when the evaluator actually grounded it in
+    something the candidate said — a bare "not addressed" note, or a score with
+    no description at all, is dropped instead of being published as a number.
+    Returns the saved ``MockInterviewAnalysis``, or the existing one (or None) if
+    the output was unusable and nothing should be overwritten.
     """
     scores = obj.get('scores') if isinstance(obj, dict) else None
     if not isinstance(scores, dict):
@@ -10796,10 +11857,11 @@ def _store_mock_analysis(interview, obj):
         if not isinstance(entry, dict):
             continue
         description = str(entry.get('description') or '').strip()
+        grounding = str(entry.get('evidence') or '').strip() or description
         percentage = max(0, min(100, _as_int(entry.get('score'), 0)))
-        if not description:
+        if not grounding or not _has_evidence(grounding):
             continue
-        metrics_by_field[field] = (percentage, description)
+        metrics_by_field[field] = (percentage, description or grounding)
 
     if not metrics_by_field:
         return _get_interview_analysis(interview)
@@ -10830,10 +11892,18 @@ def _store_mock_analysis(interview, obj):
 def _mock_analysis_generate(interview):
     """Generate and persist the analysis for ``interview`` via Gemini.
 
-    Returns the saved MockInterviewAnalysis, or None if generation failed or
+    Returns the saved MockInterviewAnalysis, or None if the interview carried too
+    little of the candidate's own words to assess, if generation failed, or if it
     produced unusable output (in which case nothing is persisted and a later
     request can simply retry).
     """
+    if _mock_user_turns(interview) < MOCK_INTERVIEW_MIN_USER_TURNS:
+        logger.info(
+            'Skipping mock interview analysis for %s — only %d candidate answers '
+            '(need %d).', interview.pk, _mock_user_turns(interview),
+            MOCK_INTERVIEW_MIN_USER_TURNS,
+        )
+        return None
     profile = getattr(interview.user, 'candidate_profile', None)
     profile_text = _chat_profile_context(interview.user, profile)
     focus = ', '.join(interview.questions) if interview.questions else 'general placement interview'
@@ -10851,7 +11921,6 @@ def _mock_analysis_generate(interview):
         .replace('{company}', company)
         .replace('{questions}', focus)
         .replace('{profile}', profile_text)
-        .replace('{count}', str(len(MOCK_INTERVIEW_ANALYSIS_DIMENSIONS)))
         .replace('{dimensions}', dimensions)
     )
     contents = [
@@ -10934,7 +12003,7 @@ def _generate_panelist_feedback(interview):
     return feedback
 
 
-def _mock_interview_payload(instance, include_messages=False):
+def _mock_interview_payload(instance, include_messages=False, message_count=None):
     data = {
         'id': str(instance.pk),
         'company_name': instance.company_name,
@@ -10947,7 +12016,9 @@ def _mock_interview_payload(instance, include_messages=False):
         'suspection': instance.suspection or 0,
         'created_at': instance.created_at.isoformat(),
         'updated_at': instance.updated_at.isoformat(),
-        'message_count': instance.messages.count(),
+        # Callers that already aggregated the message table pass the total in so
+        # the list endpoint and the stats endpoint do not disagree about it.
+        'message_count': instance.messages.count() if message_count is None else message_count,
     }
     if include_messages:
         data['messages'] = [
@@ -11062,6 +12133,13 @@ def _mock_message_history(interview):
     return contents
 
 
+def _mock_is_finished(interview):
+    """True once a mock interview is over — scored or deliberately unscored."""
+    return interview.status in (
+        MOCK_INTERVIEW_STATUS_COMPLETED, MOCK_INTERVIEW_STATUS_INSUFFICIENT,
+    )
+
+
 def _finalize_mock_interview(interview):
     """Lock a mock interview as completed and auto-fill its follow-up fields.
 
@@ -11073,10 +12151,29 @@ def _finalize_mock_interview(interview):
     completed, later calls (repeat end, keepalive from a closed tab, lazy
     analysis reads) reuse what is already stored and never double-apply.
 
+    Interviews the candidate barely answered in (fewer than
+    :data:`MOCK_INTERVIEW_MIN_USER_TURNS` of their own turns) are closed as
+    :data:`MOCK_INTERVIEW_STATUS_INSUFFICIENT` instead: no analysis, no score,
+    no score notification and no contribution to the mock pillar. An interview
+    the candidate did not take part in has no score to give, and inventing one
+    is exactly what this guards against.
+
     Returns ``(analysis_or_None, profile_update_or_None)``.
     """
-    if interview.status != 'completed':
-        interview.status = 'completed'
+    user_turns = _mock_user_turns(interview)
+    if user_turns < MOCK_INTERVIEW_MIN_USER_TURNS:
+        if interview.status != MOCK_INTERVIEW_STATUS_INSUFFICIENT:
+            interview.status = MOCK_INTERVIEW_STATUS_INSUFFICIENT
+            interview.save(update_fields=['status', 'updated_at'])
+        logger.info(
+            'Mock interview %s closed unscored — only %d candidate answers '
+            '(need %d).', interview.pk, user_turns, MOCK_INTERVIEW_MIN_USER_TURNS,
+        )
+        _refresh_readiness_for_user(interview.user)
+        return None, None
+
+    if interview.status != MOCK_INTERVIEW_STATUS_COMPLETED:
+        interview.status = MOCK_INTERVIEW_STATUS_COMPLETED
         interview.save(update_fields=['status', 'updated_at'])
 
     analysis = _get_interview_analysis(interview)
@@ -11087,7 +12184,7 @@ def _finalize_mock_interview(interview):
             logger.exception('Mock interview analysis generation failed.')
             analysis = _get_interview_analysis(interview)
 
-    if interview.status == 'completed':
+    if interview.status == MOCK_INTERVIEW_STATUS_COMPLETED:
         try:
             _notify_mock_interview_completion(interview, analysis)
         except Exception:
@@ -11222,7 +12319,7 @@ def mock_interview_reply(request):
     except (MockInterview.DoesNotExist, ValueError, TypeError, ValidationError):
         return JsonResponse({'detail': 'Mock interview not found.'}, status=404)
 
-    if interview.status == 'completed':
+    if _mock_is_finished(interview):
         return JsonResponse({'detail': 'This interview has already ended.'}, status=400)
 
     answer = str(data.get('answer') or '').strip()
@@ -11239,10 +12336,14 @@ def mock_interview_reply(request):
     duration = interview.duration or 'standard'
     if duration not in MOCK_INTERVIEW_DURATIONS:
         duration = 'standard'
+    # The host opens, but from here on the floor rotates through the panel so
+    # the candidate is talking to a panel rather than to Atlas alone.
+    speaker = _next_mock_speaker(interview, panelists)
     prompt = (
         MOCK_INTERVIEW_GUIDELINES
         + _panel_roster_text(panelists, interview.company_name)
         + company_context_block(company)
+        + _speaker_instruction(speaker)
         + MOCK_INTERVIEW_REPLY_PROMPT
         .replace('{company}', company)
         .replace('{duration}', MOCK_INTERVIEW_DURATIONS.get(duration, MOCK_INTERVIEW_DURATIONS['standard']))
@@ -11260,7 +12361,9 @@ def mock_interview_reply(request):
     text = (obj.get('text') or '').strip()
     if not text:
         return JsonResponse({'detail': 'Gemini returned an empty reply.'}, status=502)
-    panelist = _clamp_panelist(obj.get('panelist') or 'atlas', panelists)
+    # The rotation decides the speaker; the model only writes the line, so a
+    # member can never be skipped by answering "atlas" again.
+    panelist = _clamp_panelist(speaker, panelists)
     done = bool(obj.get('done'))
     tone = str(obj.get('tone') or '').strip()
     if tone not in ('positive', 'neutral', 'negative'):
@@ -11314,7 +12417,7 @@ def mock_interview_resume(request, interview_id):
     except (MockInterview.DoesNotExist, ValueError, TypeError, ValidationError):
         return JsonResponse({'detail': 'Mock interview not found.'}, status=404)
 
-    if interview.status == 'completed':
+    if _mock_is_finished(interview):
         return JsonResponse({'detail': 'This interview has already ended.'}, status=400)
 
     profile = getattr(request.user, 'candidate_profile', None)
@@ -11409,13 +12512,227 @@ def mock_interview_analysis(request, interview_id):
         return JsonResponse({'detail': 'Invalid interview id.'}, status=400)
 
     analysis = _get_interview_analysis(interview)
-    if analysis is None and interview.status == 'completed':
+    if analysis is None and interview.status == MOCK_INTERVIEW_STATUS_COMPLETED:
         try:
             analysis = _mock_analysis_generate(interview)
         except Exception:
             logger.exception('Mock interview analysis generation failed.')
             analysis = _get_interview_analysis(interview)
     return JsonResponse({'analysis': _mock_analysis_payload(analysis)})
+
+
+# Midpoint of the exchange counts each duration is briefed for (see
+# MOCK_INTERVIEW_DURATIONS). Used to turn "how many answers did they give" into
+# a comparable depth percentage, so a short session is never judged against a
+# long one's target.
+MOCK_TARGET_EXCHANGES = {
+    'short': 4,
+    'standard': 10,
+    'long': 22,
+}
+
+# Average characters per English word including the trailing space. Answers are
+# only ever counted in SQL, so their length is summed in characters and
+# converted here rather than shipping every message body to the client.
+MOCK_AVG_WORD_CHARS = 5.5
+
+
+def mock_interview_stats(request):
+    """One candidate's whole mock-interview record, reduced to plain arithmetic.
+
+    Every figure the history screen shows is a count, a sum or a mean over rows
+    that already exist: interview statuses, message rows, the tone the panel
+    itself recorded on each reply, the integrity counter, and the analysis rows
+    written earlier when each interview was finalised.
+
+    The important property here is that this endpoint **cannot** reach the
+    model. ``mock_interview_analysis`` generates an analysis on read when one
+    is missing; this one only ever *reads* analyses that are already stored, so
+    opening a candidate's history never spends a token or invents a number. The
+    per-interview score it reports is :func:`_mock_analysis_score` — the same
+    moderated mean the readiness pillar already uses — run over stored
+    percentages.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    interviews = list(
+        MockInterview.objects.filter(user=request.user).order_by('-created_at')
+    )
+
+    def empty_payload():
+        return {
+            'totals': {
+                'interviews': 0,
+                'completed': 0,
+                'not_scored': 0,
+                'active': 0,
+                'scored': 0,
+                'violations': 0,
+                'user_turns': 0,
+                'assistant_turns': 0,
+                'user_words': 0,
+                'companies': 0,
+                'roles': 0,
+            },
+            'tones': {'positive': 0, 'neutral': 0, 'negative': 0},
+            'interviews': [],
+            'by_company': [],
+            'by_role': [],
+        }
+
+    if not interviews:
+        return JsonResponse(empty_payload())
+
+    # One grouped pass over the message table. Counting the two roles in a
+    # single .values().annotate() keeps this to two queries no matter how many
+    # interviews the candidate has, and avoids the join multiplication you get
+    # from annotating the same multi-valued relation twice on the interviews.
+    turn_rows = {
+        row['interview_id']: row
+        for row in MockInterviewMessage.objects.filter(interview__in=interviews)
+        .values('interview_id')
+        .annotate(
+            user_turns=Count('id', filter=Q(role='user')),
+            assistant_turns=Count('id', filter=Q(role='assistant')),
+            positive_turns=Count('id', filter=Q(role='assistant', tone='positive')),
+            neutral_turns=Count('id', filter=Q(role='assistant', tone='neutral')),
+            negative_turns=Count('id', filter=Q(role='assistant', tone='negative')),
+            user_chars=Sum(Length('content'), filter=Q(role='user')),
+        )
+    }
+
+    # Read-only pass over the analyses written at finalisation time. No row is
+    # created here and nothing is asked of the model.
+    analysis_by_interview = {}
+    for analysis in MockInterviewAnalysis.objects.filter(
+        user=request.user, interview__in=interviews
+    ):
+        scored = [
+            (getattr(analysis, field), getattr(analysis, f'{field}_desc', ''))
+            for field, _name, _definition in MOCK_INTERVIEW_ANALYSIS_DIMENSIONS
+        ]
+        score = _mock_analysis_score(scored)
+        if score is None:
+            continue
+        analysis_by_interview[analysis.interview_id] = {
+            'overall_score': score,
+            'scored_dimensions': sum(1 for _s, description in scored if description),
+            'total_dimensions': len(MOCK_INTERVIEW_ANALYSIS_DIMENSIONS),
+            # Keyed by the display name the API already uses elsewhere, so the
+            # client can group dimensions into its own categories without a
+            # second copy of the rubric.
+            'dimensions': {
+                name: max(0, min(100, _as_int(getattr(analysis, field), 0)))
+                for field, name, _definition in MOCK_INTERVIEW_ANALYSIS_DIMENSIONS
+                if getattr(analysis, f'{field}_desc', '')
+            },
+        }
+
+    entries = []
+    company_rows = {}
+    role_rows = {}
+    totals = {
+        'interviews': len(interviews),
+        'completed': 0,
+        'not_scored': 0,
+        'active': 0,
+        'scored': 0,
+        'violations': 0,
+        'user_turns': 0,
+        'assistant_turns': 0,
+        'user_words': 0,
+    }
+    tones = {'positive': 0, 'neutral': 0, 'negative': 0}
+    companies = set()
+    roles = set()
+
+    for interview in interviews:
+        turns = turn_rows.get(interview.pk) or {}
+        user_turns = turns.get('user_turns') or 0
+        assistant_turns = turns.get('assistant_turns') or 0
+        user_chars = turns.get('user_chars') or 0
+        user_words = int(round(user_chars / MOCK_AVG_WORD_CHARS)) if user_chars else 0
+        analysis = analysis_by_interview.get(interview.pk)
+
+        entry = _mock_interview_payload(
+            interview,
+            message_count=user_turns + assistant_turns,
+        )
+        entry['user_turns'] = user_turns
+        entry['assistant_turns'] = assistant_turns
+        entry['user_words'] = user_words
+        entry['target_exchanges'] = MOCK_TARGET_EXCHANGES.get(
+            interview.duration, MOCK_TARGET_EXCHANGES['standard']
+        )
+        # None whenever the interview was never scored, which is what the client
+        # needs in order to leave that cell empty instead of printing a zero.
+        entry['analysis'] = analysis
+        entries.append(entry)
+
+        if interview.status == MOCK_INTERVIEW_STATUS_COMPLETED:
+            totals['completed'] += 1
+        elif interview.status == MOCK_INTERVIEW_STATUS_INSUFFICIENT:
+            totals['not_scored'] += 1
+        else:
+            totals['active'] += 1
+        if analysis is not None:
+            totals['scored'] += 1
+        totals['violations'] += interview.suspection or 0
+        totals['user_turns'] += user_turns
+        totals['assistant_turns'] += assistant_turns
+        totals['user_words'] += user_words
+        for tone in tones:
+            tones[tone] += turns.get(f'{tone}_turns') or 0
+
+        company = (interview.company_name or '').strip()
+        if company:
+            companies.add(company)
+        bucket = company_rows.setdefault(
+            company, {'name': company, 'interviews': 0, 'user_turns': 0, 'score_total': 0, 'scored': 0}
+        )
+        bucket['interviews'] += 1
+        bucket['user_turns'] += user_turns
+        if analysis is not None:
+            bucket['scored'] += 1
+            bucket['score_total'] += analysis['overall_score']
+
+        role = (interview.role or '').strip()
+        if role:
+            roles.add(role)
+        bucket = role_rows.setdefault(
+            role, {'name': role, 'interviews': 0, 'user_turns': 0, 'score_total': 0, 'scored': 0}
+        )
+        bucket['interviews'] += 1
+        bucket['user_turns'] += user_turns
+        if analysis is not None:
+            bucket['scored'] += 1
+            bucket['score_total'] += analysis['overall_score']
+
+    totals['companies'] = len(companies)
+    totals['roles'] = len(roles)
+
+    def finish_groups(rows):
+        out = []
+        for row in rows.values():
+            count = row['interviews']
+            out.append({
+                'name': row['name'],
+                'interviews': count,
+                'avg_user_turns': round(row['user_turns'] / count, 1) if count else 0,
+                'avg_score': round(row['score_total'] / row['scored']) if row['scored'] else None,
+                'scored': row['scored'],
+            })
+        out.sort(key=lambda r: (-r['interviews'], r['name'].lower()))
+        return out
+
+    return JsonResponse({
+        'totals': totals,
+        'tones': tones,
+        'interviews': entries,
+        'by_company': finish_groups(company_rows),
+        'by_role': finish_groups(role_rows),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -11436,7 +12753,11 @@ def _notification_audience(user):
         return Notification.objects.filter(active=True)
 
     personal = Notification.objects.filter(active=True, recipient=user)
-    platform = Notification.objects.filter(active=True, sender=NOTIFICATION_SENDER_PLATFORM)
+    platform = Notification.objects.filter(
+        active=True,
+        sender=NOTIFICATION_SENDER_PLATFORM,
+        recipient__isnull=True,
+    )
 
     if user_role(user) == ROLE_INSTITUTION_STAFF:
         institution = getattr(user, 'institution', None)
@@ -11690,23 +13011,33 @@ def _fill_due_nudges(user):
 
 
 def _mock_interview_overall_score(analysis):
-    """Mean (0-100) of the interview dimensions the evaluator actually scored."""
+    """Moderated 0-100 score for an interview analysis, or None.
+
+    Only the dimensions the evaluator could ground in something the candidate
+    actually said are counted, and the result is pulled toward the neutral
+    midpoint in proportion to how much of the rubric the interview covered (see
+    :func:`_mock_analysis_score`). None means "not enough evidence to score".
+    """
     if analysis is None:
         return None
-    scored = [
-        getattr(analysis, field)
+    return _mock_analysis_score([
+        (getattr(analysis, field), getattr(analysis, f'{field}_desc', ''))
         for field, _name, _definition in MOCK_INTERVIEW_ANALYSIS_DIMENSIONS
-        if getattr(analysis, f'{field}_desc', '')
-    ]
-    if not scored:
-        return None
-    return round(sum(scored) / len(scored))
+    ])
 
 
 def _notify_mock_interview_completion(interview, analysis):
-    """Send the TalentBro score report for a finished mock interview."""
+    """Send the TalentBro score report for a finished mock interview.
+
+    Silent when there is no score to report: an interview the candidate did not
+    really take part in gets no "you scored 48/100" notice.
+    """
     score = _mock_interview_overall_score(analysis)
     if score is None:
+        logger.info(
+            'No score report sent for mock interview %s — not enough evidence.',
+            interview.pk,
+        )
         return
     company = interview.company_name or 'Mock Interview'
     role = f' ({interview.role})' if interview.role else ''
@@ -11984,6 +13315,71 @@ def institution_companies(request):
 
 
 # ---------------------------------------------------------------------------
+#  Coursera course recommendations  (candidate /courses screen)
+# ---------------------------------------------------------------------------
+
+@require_GET
+def courses_list(request):
+    """Return Coursera courses/specialisations for the candidate /courses screen.
+
+    GET /api/courses/            ->  results for the default "data science" search
+    GET /api/courses/?q=python   ->  results for a caller-supplied search
+
+    Courses are scraped from Coursera's public search page and cached upstream,
+    so this stays a single ~2s request rather than a fan-out. Candidates only:
+    institution staff have no use for the upskilling feed. When the scrape fails
+    the reason is returned as ``detail`` (502) so the page can show it instead of
+    an empty grid.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+    if user_role(request.user) != ROLE_STUDENT:
+        return JsonResponse({'detail': 'Only candidates can view courses.'}, status=403)
+
+    query = (request.GET.get('q') or '').strip()
+    limit = request.GET.get('limit')
+
+    payload, error = get_courses(query, limit=limit)
+
+    if error:
+        return JsonResponse(
+            {
+                'detail': f'Could not load Coursera courses right now. {error}',
+                'query': query or COURSERA_DEFAULT_QUERY,
+                'courses': [],
+            },
+            status=502,
+        )
+
+    payload['query'] = query or payload.get('query') or COURSERA_DEFAULT_QUERY
+    return JsonResponse(payload)
+
+
+@require_GET
+def course_weakness_segments(request):
+    """Return the candidate's tracked weakness segments for the /courses screen.
+
+    GET /api/courses/segments/  ->  {segments: [...], count: n}
+
+    Each segment carries the weakest recent score found across mock interviews and
+    the self-training modules (English, GD, aptitude), plus the Coursera search
+    phrase that addresses it. Segments are ordered weakest-first, so the front end
+    can lead with the most urgent gap and treat ``segments[0]`` as the default.
+
+    An empty list is a normal answer, not an error: a candidate who has not
+    trained yet simply has no tracked weakness, and the page falls back to the
+    neutral default search.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+    if user_role(request.user) != ROLE_STUDENT:
+        return JsonResponse({'detail': 'Only candidates can view courses.'}, status=403)
+
+    segments = collect_weakness_segments(request.user)
+    return JsonResponse({'segments': segments, 'count': len(segments)})
+
+
+# ---------------------------------------------------------------------------
 #  Placement-drive companies  (institution dashboard)
 # ---------------------------------------------------------------------------
 
@@ -12003,8 +13399,70 @@ def _client_institution(user):
     return Institution.objects.filter(user_id=user.pk).first()
 
 
-def _company_payload(company):
-    """Serialize a Company row for the frontend /api/companies/ response."""
+def _sum_drive_vacancies(rows):
+    """Total openings across an iterable of (total_vacancies, roles) drive rows.
+
+    Mirrors Drive.vacancies per drive: the stored total_vacancies when set,
+    otherwise the sum of the per-role vacancy counts in Drive.roles. A single
+    source of truth so the companies, drives, dashboard, reports and the
+    total-vacancies endpoint all count the same openings.
+    """
+    total = 0
+    for stored, roles in rows:
+        if stored is not None:
+            total += stored
+        else:
+            total += sum(
+                int(role.get('vacancies') or 0)
+                for role in (roles or [])
+                if isinstance(role, dict)
+            )
+    return total
+
+
+def _institution_openings(institution):
+    """Total vacancies across every Drive of one institution, in one query."""
+    if institution is None:
+        return 0
+    return _sum_drive_vacancies(
+        Drive.objects
+        .filter(institution=institution)
+        .values_list('total_vacancies', 'roles')
+    )
+
+
+def _drive_totals_by_company(companies):
+    """Sum each company's Drive vacancies in a single query.
+
+    Returns {company_pk: {'openings': <int>, 'count': <int>}}; only companies
+    that actually have a drive appear.
+    """
+    totals = {}
+    rows = (
+        Drive.objects
+        .filter(company__in=companies)
+        .values_list('company_id', 'total_vacancies', 'roles')
+    )
+    for company_pk, stored, roles in rows:
+        bucket = totals.setdefault(company_pk, {'openings': 0, 'count': 0})
+        bucket['openings'] += _sum_drive_vacancies([(stored, roles)])
+        bucket['count'] += 1
+    return totals
+
+
+def _company_payload(company, drive_totals=None):
+    """Serialize a Company row for the frontend /api/companies/ response.
+
+    ``openings`` is the sum of the vacancies across the company's Drive rows.
+    A company with no drives yet reports zero openings.
+    """
+    if drive_totals is None:
+        openings = 0
+        drive_count = 0
+    else:
+        bucket = drive_totals.get(company.pk, {})
+        openings = bucket.get('openings', 0)
+        drive_count = bucket.get('count', 0)
     return {
         'id': company.pk,
         'company_id': company.company_id,
@@ -12023,7 +13481,8 @@ def _company_payload(company):
         'salary_max': float(company.salary_max) if company.salary_max is not None else None,
         'work_location': company.work_location,
         'work_mode': company.work_mode,
-        'number_of_openings': company.number_of_openings,
+        'openings': openings,
+        'drive_count': drive_count,
         'selection_rounds': company.selection_rounds or [],
         'application_deadline': (
             company.application_deadline.isoformat()
@@ -12060,8 +13519,10 @@ def companies_list(request):
         Company.objects.filter(institution=institution).order_by('-salary_max')
         if institution is not None else Company.objects.none()
     )
-    companies = [_company_payload(c) for c in queryset]
-    return JsonResponse({'companies': companies, 'count': len(companies)})
+    companies = queryset
+    drive_totals = _drive_totals_by_company(companies)
+    payload = [_company_payload(c, drive_totals) for c in companies]
+    return JsonResponse({'companies': payload, 'count': len(payload)})
 
 
 def company_create(request):
@@ -12130,7 +13591,6 @@ def company_create(request):
         salary_max=data.get('salary_max') if data.get('salary_max') not in (None, '') else None,
         work_location=str(data.get('work_location', '')).strip(),
         work_mode=str(data.get('work_mode') or 'onsite'),
-        number_of_openings=_as_int(data.get('number_of_openings')),
         selection_rounds=_as_str_list(data.get('selection_rounds')),
         recruitment_status=str(data.get('recruitment_status') or 'upcoming'),
         placement_mode=str(data.get('placement_mode') or 'full_time'),
@@ -12139,7 +13599,7 @@ def company_create(request):
         institution=institution,
         client=client,
     )
-    return JsonResponse({'company': _company_payload(company)}, status=201)
+    return JsonResponse({'company': _company_payload(company, {})}, status=201)
 
 
 @require_GET
@@ -12217,7 +13677,8 @@ def _candidate_payload(c, readiness=None, ranks=None):
 
     ``readiness`` is the candidate's flattened readiness components and
     ``ranks`` their ``{overall, department, total, department_total}`` mapping;
-    both are optional so callers that do not need scoring stay unchanged.
+    both are optional so callers that do not need scoring stay unchanged. The
+    independent per-pillar standings are added by the caller as ``pillars``.
     """
     return {
         'id': str(c.candidate_id),
@@ -12233,7 +13694,11 @@ def _candidate_payload(c, readiness=None, ranks=None):
         'gender': c.gender,
         'cgpa': float(c.cgpa) if c.cgpa is not None else None,
         'placement_status': c.placement_status,
-        'placement_eligible': c.placement_eligible,
+        # Resolved, not raw: the key stays a plain boolean so every consumer of
+        # the student payload agrees with the dashboard and reports, while the
+        # untouched override is exposed separately for the admin/UI to show.
+        'placement_eligible': _effective_eligible(c),
+        'placement_eligible_override': c.placement_eligible,
         'skills': c.skills or [],
         'preferred_roles': c.preferred_roles or [],
         'preferred_locations': c.preferred_locations or [],
@@ -12251,7 +13716,7 @@ def _candidate_payload(c, readiness=None, ranks=None):
     }
 
 
-def _drive_payload(company, eligible_count):
+def _drive_payload(company, eligible_count, openings=0):
     """Serialize a Company row as a placement drive card for the client UI."""
     if company.recruitment_status == 'ongoing':
         status = 'Live'
@@ -12280,7 +13745,7 @@ def _drive_payload(company, eligible_count):
             if company.campus_visit_date else None
         ),
         'status': status,
-        'openings': company.number_of_openings,
+        'openings': openings,
         'eligible_courses': company.eligible_courses or [],
         'eligible_branches': company.eligible_branches or [],
         'minimum_cgpa': float(company.minimum_cgpa) if company.minimum_cgpa is not None else None,
@@ -12299,12 +13764,13 @@ def _eligible_student_count(institution, company):
     This is the "front of the queue" number â€” students who are eligible, not
     yet placed and meet the company's CGPA / branch / course bar.
     """
-    queryset = CandidateProfile.objects.filter(
-        college=institution,
-        placement_eligible=True,
-        cgpa__isnull=False,
-        account_status='active',
-    ).exclude(placement_status='placed')
+    queryset = _with_effective_eligibility(
+        CandidateProfile.objects.filter(
+            college=institution,
+            cgpa__isnull=False,
+            account_status='active',
+        ).exclude(placement_status='placed')
+    ).filter(effective_eligible=True)
     if company.minimum_cgpa is not None:
         queryset = queryset.filter(cgpa__gte=company.minimum_cgpa)
     matches = []
@@ -12335,7 +13801,8 @@ def _monthly_students(institution, months=8):
 def _department_stats(institution):
     stats = {}
     for c in CandidateProfile.objects.filter(college=institution).only(
-        'department', 'cgpa', 'placement_status', 'placement_eligible', 'expected_ctc'
+        'department', 'cgpa', 'placement_status', 'placement_eligible',
+        'readiness_score', 'expected_ctc',
     ):
         dept = c.department or 'Unassigned'
         row = stats.setdefault(dept, {
@@ -12345,7 +13812,7 @@ def _department_stats(institution):
             'cgpa_sum': 0.0, 'cgpa_count': 0, 'ctc_sum': 0.0, 'ctc_count': 0,
         })
         row['total'] += 1
-        if c.placement_eligible and c.cgpa is not None:
+        if _effective_eligible(c) and c.cgpa is not None:
             row['eligible'] += 1
         if c.placement_status == 'placed':
             row['placed'] += 1
@@ -12382,7 +13849,9 @@ def institution_overview(request):
     candidates = CandidateProfile.objects.filter(college=institution)
     companies = Company.objects.filter(institution=institution)
 
-    eligible_qs = candidates.filter(placement_eligible=True, cgpa__isnull=False)
+    eligible_qs = _with_effective_eligibility(candidates).filter(
+        effective_eligible=True, cgpa__isnull=False,
+    )
     placed_qs = candidates.filter(placement_status='placed')
     cgpa_float = [float(c) for c in candidates.exclude(cgpa__isnull=True).values_list('cgpa', flat=True)]
     ctc_float = [float(c) for c in candidates.exclude(expected_ctc__isnull=True).values_list('expected_ctc', flat=True)]
@@ -12406,9 +13875,7 @@ def institution_overview(request):
         'avg_expected_ctc': round(sum(ctc_float) / len(ctc_float), 1) if ctc_float else None,
         'recruiters': companies.count(),
         'active_drives': active_drives,
-        'total_openings': sum(
-            [c.number_of_openings or 0 for c in companies.only('number_of_openings')]
-        ),
+        'total_openings': _institution_openings(institution),
         'super_dream': companies.filter(tier='super_dream').count(),
         'verified': verified,
         'unverified': total - verified,
@@ -12478,7 +13945,8 @@ def institution_overview(request):
 def students_list(request):
     """Filterable list of the institution's candidates (students).
 
-    GET /api/students/?q=&dept=&status=&min_cgpa=&eligible=1  ->  {students, count}
+    GET /api/students/?q=&dept=&status=&min_cgpa=&eligible=1
+        ->  {students, count, total, approximate_student_strength}
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
@@ -12492,8 +13960,10 @@ def students_list(request):
     # institution (not the filtered subset) so a student's rank never shifts
     # when the placement team narrows the view.
     all_profiles = list(queryset)
-    score_map, overall_ranks, department_ranks, totals = _refresh_readiness_college(
-        college_id=institution.pk, profiles=all_profiles,
+    score_map, overall_ranks, department_ranks, totals, pillar_ranks = (
+        _refresh_readiness_college(
+            college_id=institution.pk, profiles=all_profiles,
+        )
     )
 
     q = str(request.GET.get('q') or '').strip().lower()
@@ -12520,7 +13990,9 @@ def students_list(request):
     if min_cgpa > 0:
         queryset = queryset.filter(cgpa__isnull=False, cgpa__gte=min_cgpa)
     if request.GET.get('eligible') == '1':
-        queryset = queryset.filter(placement_eligible=True, cgpa__isnull=False)
+        queryset = _with_effective_eligibility(queryset).filter(
+            effective_eligible=True, cgpa__isnull=False,
+        )
 
     sort = str(request.GET.get('sort') or 'cgpa')
     ordering = {
@@ -12542,7 +14014,14 @@ def students_list(request):
             'total': totals['overall_total'],
             'department_total': totals['department_totals'].get(c.department or '', 0),
         }
-        payload.append(_candidate_payload(c, readiness=readiness, ranks=ranks))
+        row = _candidate_payload(c, readiness=readiness, ranks=ranks)
+        row['pillars'] = {
+            pillar: _pillar_rank_payload(
+                pillar_ranks, pillar, key, c.department or '',
+            )
+            for pillar in PERF_RANKED_PILLARS
+        }
+        payload.append(row)
 
     if sort == 'performance':
         payload.sort(
@@ -12552,7 +14031,17 @@ def students_list(request):
             ),
         )
 
-    return JsonResponse({'students': payload, 'count': len(payload)})
+    return JsonResponse({
+        'students': payload,
+        # Rows after the active filters, and the full candidate roll of the
+        # college regardless of them, so the directory can report the real
+        # student count instead of only what the current view happens to show.
+        'count': len(payload),
+        'total': totals['overall_total'],
+        # The institution's own approximate student strength, which is broader
+        # still: it covers students who have no candidate profile in the system.
+        'approximate_student_strength': institution.approximate_student_strength,
+    })
 
 
 @require_GET
@@ -12574,8 +14063,8 @@ def readiness_leaderboard(request):
     profiles = list(
         CandidateProfile.objects.filter(college_id=institution.pk)
     )
-    score_map, overall_ranks, department_ranks, totals = _refresh_readiness_college(
-        college_id=institution.pk, profiles=profiles,
+    score_map, overall_ranks, department_ranks, totals, pillar_ranks = (
+        _refresh_readiness_college(college_id=institution.pk, profiles=profiles)
     )
 
     payload = []
@@ -12592,6 +14081,12 @@ def readiness_leaderboard(request):
             'department_total': totals['department_totals'].get(c.department or '', 0),
         }
         row = _candidate_payload(c, readiness=readiness, ranks=ranks)
+        row['pillars'] = {
+            pillar: _pillar_rank_payload(
+                pillar_ranks, pillar, key, c.department or '',
+            )
+            for pillar in PERF_RANKED_PILLARS
+        }
         row['is_self'] = request.user.pk == c.user_id
         payload.append(row)
 
@@ -12611,13 +14106,166 @@ def readiness_leaderboard(request):
     })
 
 
+# Longest body a student-to-student note may carry, to keep the thread readable.
+STUDENT_MESSAGE_MAX_CHARS = 2000
+
+# How much of a note is quoted in the bell notification it triggers.
+STUDENT_MESSAGE_PREVIEW_CHARS = 140
+
+
+def _student_display_name(user):
+    """Best available name for a messaging peer.
+
+    Signup usually only fills the CandidateProfile, so fall back through the
+    profile name before the bare username — keeps chat bubbles and the bell
+    notification showing the same person.
+    """
+    name = user.get_full_name().strip()
+    if name:
+        return name
+    profile = getattr(user, 'candidate_profile', None)
+    if profile is not None and profile.full_name:
+        return profile.full_name
+    return user.username
+
+
+def _serialize_student_message(instance, viewer_id):
+    return {
+        'id': str(instance.pk),
+        'content': instance.content,
+        'created_at': instance.created_at.isoformat(),
+        'from_user_id': instance.from_user_id,
+        'to_user_id': instance.to_user_id,
+        'from_name': _student_display_name(instance.from_user),
+        # Lets the sender's own bubbles render on the right without a second lookup.
+        'is_mine': instance.from_user_id == viewer_id,
+    }
+
+
+def _student_message_redirect_path(sender_user):
+    """Route the recipient's bell tap should open.
+
+    /student-message always resolves against the *tapper's* own candidate id;
+    the ``peer`` param only picks which conversation to show inside that
+    window, so the URL never carries the recipient's id.
+    """
+    sender_profile = getattr(sender_user, 'candidate_profile', None)
+    if sender_profile is None:
+        return '/student-message'
+    return f'/student-message?peer={sender_profile.candidate_id}'
+
+
+def _notify_student_message(sender_user, recipient_user, message):
+    """Raise a TalentBro Platform notification for a freshly sent student note.
+
+    ``_push_personal_notification`` keys off ``student_message:<id>``, so a
+    retried POST for the same row can never double-notify while every distinct
+    note still rings the recipient's bell.
+    """
+    preview = ' '.join(message.content.split())
+    if len(preview) > STUDENT_MESSAGE_PREVIEW_CHARS:
+        preview = preview[:STUDENT_MESSAGE_PREVIEW_CHARS].rstrip() + '…'
+    _push_personal_notification(
+        recipient_user,
+        f'student_message:{message.pk}',
+        f'New message from {_student_display_name(sender_user)}',
+        preview,
+        _student_message_redirect_path(sender_user),
+    )
+
+
+@require_http_methods(['GET', 'POST'])
+def student_messages(request, student_id):
+    """Direct notes between the signed-in student and another candidate.
+
+    The conversation always belongs to ``request.user``; ``student_id`` is only
+    the candidate id of the *peer* being viewed, resolved from the viewer's own
+    session so nobody can read another candidate's thread by editing the URL.
+
+    GET  ->  {viewer_candidate_id, student_id, peer, messages}
+             the thread oldest first, plus the few profile fields the message
+             screen's header shows
+    POST ->  {message}   stores one note from the sender and pushes a TalentBro
+             Platform notification to the recipient
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    try:
+        peer = CandidateProfile.objects.get(candidate_id=student_id)
+    except (CandidateProfile.DoesNotExist, ValidationError, ValueError, TypeError):
+        return JsonResponse({'detail': 'Student not found.'}, status=404)
+    if peer.user_id is None:
+        return JsonResponse(
+            {'detail': 'This student has no linked account to message.'}, status=400
+        )
+
+    viewer_profile = getattr(request.user, 'candidate_profile', None)
+    is_self = peer.user_id == request.user.pk
+
+    if request.method == 'GET':
+        if is_self:
+            thread = StudentMessage.objects.none()
+        else:
+            thread = StudentMessage.objects.filter(
+                Q(from_user=request.user, to_user=peer.user)
+                | Q(from_user=peer.user, to_user=request.user)
+            )
+        return JsonResponse({
+            'viewer_candidate_id': (
+                str(viewer_profile.candidate_id) if viewer_profile else None
+            ),
+            'student_id': str(peer.candidate_id),
+            'is_self': is_self,
+            'peer': {
+                'id': str(peer.candidate_id),
+                'full_name': peer.full_name,
+                'department': peer.department,
+                'program': peer.program,
+                'start_year': peer.start_year,
+                'end_year': peer.end_year,
+            },
+            'messages': [
+                _serialize_student_message(m, request.user.pk) for m in thread
+            ],
+        })
+
+    if is_self:
+        return JsonResponse(
+            {'detail': 'You cannot send a message to yourself.'}, status=400
+        )
+
+    data = _json_body(request)
+    if data is None:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+    content = str(data.get('content') or '').strip()
+    if not content:
+        return JsonResponse({'detail': 'Message cannot be empty.'}, status=400)
+    if len(content) > STUDENT_MESSAGE_MAX_CHARS:
+        return JsonResponse(
+            {'detail': f'Message is too long (max {STUDENT_MESSAGE_MAX_CHARS} characters).'},
+            status=400,
+        )
+
+    message = StudentMessage.objects.create(
+        from_user=request.user, to_user=peer.user, content=content,
+    )
+    _notify_student_message(request.user, peer.user, message)
+    return JsonResponse(
+        {'message': _serialize_student_message(message, request.user.pk)}, status=201
+    )
+
+
 @require_GET
 def drives_list(request):
     """Placement drives for the client, derived from the recorded Company rows.
 
-    GET /api/drives/  ->  {drives, count}
+    GET /api/drives/  ->  {drives, count, drive_count}
     Each drive carries the number of genuinely-eligible candidates so the
     placement team can line the right students up for the company.
+    ``count`` is how many company rows back the listing, while ``drive_count``
+    is how many Drive records the college actually has on file - the page shows
+    that as the "Total Drives" figure.
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
@@ -12626,10 +14274,63 @@ def drives_list(request):
         return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
 
     companies = Company.objects.filter(institution=institution).order_by('-campus_visit_date', '-created_at')
+    drive_totals = _drive_totals_by_company(companies)
     drives = []
     for company in companies:
-        drives.append(_drive_payload(company, _eligible_student_count(institution, company)))
-    return JsonResponse({'drives': drives, 'count': len(drives)})
+        drives.append(_drive_payload(
+            company,
+            _eligible_student_count(institution, company),
+            drive_totals.get(company.pk, {}).get('openings', 0),
+        ))
+    return JsonResponse({
+        'drives': drives,
+        'count': len(drives),
+        'drive_count': Drive.objects.filter(institution=institution).count(),
+    })
+
+
+@require_GET
+def drives_total_vacancies(request):
+    """Total vacancies across every Drive of the signed-in staff's institution.
+
+    GET /api/drives/total-vacancies/
+        ->  {"total_vacancies": <int>, "drive_count": <int>, "institution": "<name>"|null}
+
+    Sums Drive.vacancies over the college's drives - the stored
+    Drive.total_vacancies per drive when set, otherwise the sum of the
+    per-role vacancy counts in Drive.roles. Cancelled and completed drives are
+    included; pass ?status=ongoing to narrow it to one status.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse({
+            'total_vacancies': 0,
+            'drive_count': 0,
+            'institution': None,
+        })
+
+    drives = Drive.objects.filter(institution=institution)
+    status = (request.GET.get('status') or '').strip()
+    if status:
+        valid = {key for key, _ in RECRUITMENT_STATUS_CHOICES}
+        if status not in valid:
+            return JsonResponse(
+                {'detail': f'Invalid status "{status}". '
+                           f'Expected one of: {", ".join(sorted(valid))}.'},
+                status=400,
+            )
+        drives = drives.filter(status=status)
+
+    return JsonResponse({
+        'total_vacancies': _sum_drive_vacancies(
+            drives.values_list('total_vacancies', 'roles')
+        ),
+        'drive_count': drives.count(),
+        'institution': institution.name,
+    })
 
 
 @require_GET
@@ -12648,7 +14349,9 @@ def reports_data(request):
     companies = Company.objects.filter(institution=institution)
     total = candidates.count()
     placed = candidates.filter(placement_status='placed').count()
-    eligible = candidates.filter(placement_eligible=True, cgpa__isnull=False).count()
+    eligible = _with_effective_eligibility(candidates).filter(
+        effective_eligible=True, cgpa__isnull=False,
+    ).count()
     ctc_float = [float(c) for c in candidates.exclude(expected_ctc__isnull=True).values_list('expected_ctc', flat=True)]
 
     kpis = {
@@ -12658,13 +14361,13 @@ def reports_data(request):
         'rate': round(placed / total * 100) if total else 0,
         'avg_expected_ctc': round(sum(ctc_float) / len(ctc_float), 1) if ctc_float else None,
         'recruiters': companies.count(),
-        'openings': sum([c.number_of_openings or 0 for c in companies.only('number_of_openings')]),
+        'openings': _institution_openings(institution),
     }
 
     industries = {}
     tier_buckets = {'super_dream': 0, 'dream': 0, 'core': 0, 'mass': 0}
     band_buckets = {}
-    for c in companies.only('industry', 'tier', 'salary_max', 'number_of_openings'):
+    for c in companies.only('industry', 'tier', 'salary_max'):
         industries[c.industry or 'Other'] = industries.get(c.industry or 'Other', 0) + 1
         tier_buckets[c.tier] = tier_buckets.get(c.tier, 0) + 1
         top = float(c.salary_max) if c.salary_max is not None else 0
@@ -12741,7 +14444,39 @@ _EDGE_TTS_VOICE_GENDER = {
 }
 
 
-def _edge_tts_synthesize(text, voice):
+# Edge only serves three usable Indian English voices (en-IN-PrabhatNeural and
+# the en-IN-Neerja pair — verified against the live endpoint), so the five male
+# panelists would otherwise all share one identical voice. Per-speaker pitch and
+# rate offsets are what actually tell them apart, so the panel keeps one
+# familiar Indian accent while every member still sounds like a different person.
+EDGE_TTS_PITCH_LIMIT_HZ = 50
+EDGE_TTS_RATE_LIMIT_PCT = 30
+
+
+def _edge_tts_style(payload):
+    """Read optional per-speaker ``pitch``/``rate`` offsets from a TTS payload.
+
+    Returns an ``(pitch, rate)`` pair of Edge-formatted strings (``'+0Hz'``,
+    ``'+0%'``). Values are clamped to a natural-sounding range; anything
+    missing, non-numeric, or out of range falls back to the voice's own
+    neutral delivery, so a bad client can never produce a broken request.
+    """
+    pitch, rate = 0.0, 0.0
+    if isinstance(payload, dict):
+        try:
+            pitch = float(payload.get('pitch') or 0)
+        except (TypeError, ValueError):
+            pitch = 0.0
+        try:
+            rate = float(payload.get('rate') or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+    pitch = max(-EDGE_TTS_PITCH_LIMIT_HZ, min(EDGE_TTS_PITCH_LIMIT_HZ, pitch))
+    rate = max(-EDGE_TTS_RATE_LIMIT_PCT, min(EDGE_TTS_RATE_LIMIT_PCT, rate))
+    return f'{pitch:+.0f}Hz', f'{rate:+.0f}%'
+
+
+def _edge_tts_synthesize(text, voice, pitch='+0Hz', rate='+0%'):
     """Synthesize ``text`` in ``voice``, retrying once for transient blips.
 
     Returns the raw MP3 bytes, or ``b''`` on failure.
@@ -12752,7 +14487,7 @@ def _edge_tts_synthesize(text, voice):
             import asyncio
 
             async def _synthesize():
-                communicate = edge_tts.Communicate(text, voice, rate='+0%', pitch='+0Hz')
+                communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
                 chunks: list[bytes] = []
                 async for chunk in communicate.stream():
                     if chunk['type'] == 'audio':
@@ -12794,7 +14529,7 @@ def _locate_boundaries(text, boundaries):
     return pairs
 
 
-def _edge_tts_synthesize_timed(text, voice):
+def _edge_tts_synthesize_timed(text, voice, pitch='+0Hz', rate='+0%'):
     """Synthesize ``text`` in ``voice``, capturing each word's exact start time.
 
     Like ``_edge_tts_synthesize`` but requests WordBoundary metadata so the
@@ -12810,7 +14545,7 @@ def _edge_tts_synthesize_timed(text, voice):
 
             async def _synthesize():
                 communicate = edge_tts.Communicate(
-                    text, voice, rate='+0%', pitch='+0Hz', boundary='WordBoundary'
+                    text, voice, rate=rate, pitch=pitch, boundary='WordBoundary'
                 )
                 chunks: list[bytes] = []
                 boundaries: list[tuple[str, int]] = []
@@ -12833,7 +14568,7 @@ def _edge_tts_synthesize_timed(text, voice):
     return b'', []
 
 
-def _edge_tts_generate(text, voice_key=''):
+def _edge_tts_generate(text, voice_key='', pitch='+0Hz', rate='+0%'):
     """Generate an MP3 audio clip using Edge TTS (free neural voices).
 
     ``voice_key`` is the curated Maya key (``neerja``) or a literal Edge voice
@@ -12854,13 +14589,13 @@ def _edge_tts_generate(text, voice_key=''):
     if fallback not in candidates:
         candidates.append(fallback)
     for voice in candidates:
-        audio = _edge_tts_synthesize(text, voice)
+        audio = _edge_tts_synthesize(text, voice, pitch, rate)
         if audio:
             return audio
     return b''
 
 
-def _edge_tts_generate_timed(text, voice_key=''):
+def _edge_tts_generate_timed(text, voice_key='', pitch='+0Hz', rate='+0%'):
     """Like ``_edge_tts_generate`` but also returns per-word start timings."""
     key = (voice_key or '').strip()
     gender = _EDGE_TTS_VOICE_GENDER.get(key.lower())
@@ -12873,7 +14608,7 @@ def _edge_tts_generate_timed(text, voice_key=''):
     if fallback not in candidates:
         candidates.append(fallback)
     for voice in candidates:
-        audio, pairs = _edge_tts_synthesize_timed(text, voice)
+        audio, pairs = _edge_tts_synthesize_timed(text, voice, pitch, rate)
         if audio:
             return audio, pairs
     return b'', []
@@ -12890,8 +14625,11 @@ def tts(request):
     Setting ``"boundaries": true`` in the body also requests WordBoundary
     metadata; when available the exact per-word start times are returned in the
     ``X-Word-Times`` header as ``<char_offset>:<start_ms>`` pairs (comma
-    separated, in stream order) so the frontend highlight stays in sync with
-    the clip instead of estimating from linear progress.
+    separated, in stream order) so the frontend highlight stays in sync with the
+    clip instead of estimating from linear progress.
+
+    Optional ``"pitch"`` (Hz, +/-50) and ``"rate"`` (percent, +/-30) let one
+    Edge voice serve several distinct panelists.
 
     GET ``/api/chat/tts/voices/`` returns the available voice options.
     """
@@ -12911,11 +14649,12 @@ def tts(request):
         text = text[:4000]
 
     voice_key = str(data.get('voice') or '').strip()
+    pitch, rate = _edge_tts_style(data)
     timed = bool(data.get('boundaries'))
     if timed:
-        audio, pairs = _edge_tts_generate_timed(text, voice_key)
+        audio, pairs = _edge_tts_generate_timed(text, voice_key, pitch, rate)
     else:
-        audio = _edge_tts_generate(text, voice_key)
+        audio = _edge_tts_generate(text, voice_key, pitch, rate)
         pairs = []
 
     if not audio:
