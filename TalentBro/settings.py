@@ -76,7 +76,41 @@ SECRET_KEY = 'django-insecure-p6(!=nvzhn80-s56rg^8h9l_9%n&4syc(=ut4&u=%p*9knpf2m
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['*']
+# Hosts this process will answer for. Replaces ALLOWED_HOSTS = ['*'].
+#
+# Django strips the port before matching (django/http/request.py:195 calls
+# split_domain_port and validates only the domain half), so the bare hostnames
+# below already cover every port - never add "localhost:8000" style entries,
+# they can never match. "testserver" is not needed either; Django's test
+# runner appends it to ALLOWED_HOSTS itself.
+#
+# The leading-dot form is deliberately not used. ".talentbro.in" would be
+# tidier but would also admit any forgotten staging or preview subdomain, which
+# is the same class of exposure as the old CORS_ALLOW_ALL_ORIGINS.
+ALLOWED_HOSTS = [
+    # Production - the institutions SPA and this API
+    'talentbro.in',
+    'www.talentbro.in',
+    'ins.talentbro.in',
+    'ins-api.talentbro.in',
+    # Local development
+    'localhost',
+    '127.0.0.1',
+    '[::1]',
+    '0.0.0.0',
+]
+# If the student-facing API turns out to be served by this same process, add
+# 'api.talentbro.in' to the list above.
+
+# Escape hatch for hosts that cannot be known when this file is written -
+# preview deploys, a bare public IP. Comma separated, no spaces needed:
+#   ALLOWED_HOSTS=203.0.113.7,my-branch.preview.example
+# Entries here are appended to the list above, never a replacement for it.
+_extra_allowed_hosts = [
+    host.strip() for host in os.environ.get('ALLOWED_HOSTS', '').split(',') if host.strip()
+]
+if _extra_allowed_hosts:
+    ALLOWED_HOSTS += _extra_allowed_hosts
 
 # Voice recordings are uploaded as raw audio (WAV) for transcription. Keep them
 # under the backend's per-request memory cap so transcription never 400s.
@@ -133,19 +167,23 @@ TEMPLATES = [
 WSGI_APPLICATION = 'TalentBro.wsgi.application'
 
 
-# CORS - allow any origin to call the service
+# CORS - only the origins the SPAs are actually served from
 
-CORS_ALLOW_ALL_ORIGINS = True
-# Previous explicit list, kept for reference:
-# CORS_ALLOWED_ORIGINS = [
-#     'https://talentbro.in',
-#     'https://www.talentbro.in',
-#     'https://ins.talentbro.in',
-#     'http://localhost:8080',
-#     'http://127.0.0.1:8080',
-#     'http://localhost:8081',
-#     'http://127.0.0.1:8081',
-# ]
+# Was CORS_ALLOW_ALL_ORIGINS = True. Combined with CORS_ALLOW_CREDENTIALS that
+# made django-cors-headers reflect *any* caller's Origin back with
+# Access-Control-Allow-Credentials: true, so any site could make credentialed
+# calls to the API and read the responses. The explicit list keeps every host
+# that works today and closes that off. CSRF_TRUSTED_ORIGINS below restricts
+# the same set for unsafe methods; the two should be kept in step.
+CORS_ALLOWED_ORIGINS = [
+    'https://talentbro.in',
+    'https://www.talentbro.in',
+    'https://ins.talentbro.in',
+    'http://localhost:8080',
+    'http://127.0.0.1:8080',
+    'http://localhost:8081',
+    'http://127.0.0.1:8081',
+]
 CORS_ALLOW_CREDENTIALS = True
 
 # Origins allowed to make CSRF-protected (POST) calls from the SPA frontend.

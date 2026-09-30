@@ -908,18 +908,6 @@ def login_view(request):
 
     user = authenticate(request, username=email, password=password)
     if user is None:
-        # `authenticate` matches on User.USERNAME_FIELD, which is "username".
-        # Signup stores username=email so that lookup normally works, but
-        # accounts created by older code paths and the seed scripts put
-        # something else there (e.g. ceo@talentbro.in -> "AnirbanBhattacharya",
-        # tts@t.com -> "tts_smoke"). Those accounts could never log in. Fall
-        # back to the email column and verify the password against that row.
-        # is_active is re-checked by hand because authenticate() normally does
-        # it via user_can_authenticate, and check_password() does not.
-        by_email = User.objects.filter(email__iexact=email).first()
-        if by_email is not None and by_email.is_active and by_email.check_password(password):
-            user = by_email
-    if user is None:
         return JsonResponse({'detail': 'Invalid email or password.'}, status=400)
 
     # The role is derived from the account's stored profile, so a user always
