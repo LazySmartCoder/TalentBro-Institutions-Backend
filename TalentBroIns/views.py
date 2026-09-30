@@ -32,6 +32,7 @@ from django.utils.crypto import get_random_string
 from django.utils.dateparse import parse_date
 from django.utils.text import slugify
 from django.urls import reverse
+from django.middleware.csrf import get_token
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
@@ -812,8 +813,16 @@ def _title_from_prompt(prompt, max_words=4):
 @require_GET
 @ensure_csrf_cookie
 def csrf(request):
-    """Sets the csrftoken cookie for the SPA."""
-    return JsonResponse({'ok': True})
+    """Set the csrftoken cookie and hand the token to the SPA.
+
+    The token comes back in the body as well as in the cookie because the SPA
+    (ins.talentbro.in) and this API (ins-api.talentbro.in) are different
+    subdomains: a host-only cookie is still sent back to the API but stays
+    invisible to the page's own JS, so the X-CSRFToken header gets silently
+    dropped and every POST fails with "Forbidden (CSRF token missing.)".
+    Returning the token removes that dependency on how the cookie is scoped.
+    """
+    return JsonResponse({'ok': True, 'csrfToken': get_token(request)})
 
 
 @require_POST

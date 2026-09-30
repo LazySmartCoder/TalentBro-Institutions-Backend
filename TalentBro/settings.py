@@ -247,37 +247,48 @@ SESSION_EXPIRE_AT_BROWSER_CLOSE = False  # survive browser restarts
 SESSION_SAVE_EVERY_REQUEST = True  # sliding: extend the window on every visit
 
 # The SPA (ins.talentbro.in) calls the API (ins-api.talentbro.in) cross-origin.
-# The frontend reads `csrftoken` out of `document.cookie` and echoes it back in
-# the X-CSRFToken header (see Frontend/src/lib/api.ts), so the cookie has to be
-# scoped to the shared parent domain — a host-only cookie on ins-api would be
-# invisible to the page's own JS and every POST would fail CSRF. The two hosts
-# are same-site (both under talentbro.in), so the default SameSite=Lax still
-# rides along on the fetch; only the domain scope and the Secure flag matter.
-# True in production (https only, cookies scoped to the shared parent domain so
-# the SPA can read csrftoken). False for local development over plain http:
-#   * CSRF_COOKIE_SECURE=True makes the browser refuse to store/send `csrftoken`
-#     on http://localhost, so every POST died with
+# The frontend echoes the `csrftoken` back in the X-CSRFToken header (see
+# Frontend/src/lib/api.ts), so the cookie has to be scoped to the shared parent
+# domain — a host-only cookie on ins-api is still sent back to the API, but it is
+# invisible to the page's own JS, so the header is silently omitted and every
+# POST fails with "Forbidden (CSRF token missing.)". The two hosts are same-site
+# (both under talentbro.in), so the default SameSite=Lax still rides along on the
+# fetch; only the domain scope and the Secure flag matter.
+#
+# This is the PRODUCTION configuration, so it is also the default. It is
+# deliberately NOT derived from DEBUG: DEBUG is hardcoded True above, and keying
+# the cookie settings off it silently strips the parent-domain scope on the
+# deployed server, reintroducing exactly the failure above.
+#
+# Local development over plain http opts out with SECURE_COOKIES=false in
+# Backend/.env, because the production settings are actively harmful there:
+#   * CSRF_COOKIE_SECURE=True makes the browser refuse to store or send
+#     `csrftoken` on http://localhost, so every POST died with
 #     "Forbidden (CSRF cookie not set.)" - the cookie never reached Django.
-#   * CSRF_COOKIE_DOMAIN='.talentbro.in' is a domain mismatch on localhost, so
-#     the browser would drop both the csrf and session cookies anyway, and the
-#     login session would not survive the redirect.
-# Locally the cookies therefore stay host-only and non-secure. Override either
-# way with SECURE_COOKIES=true|false in .env, so a deploy that still runs with
-# DEBUG=True can force the production behaviour back on.
-SECURE_COOKIES = os.environ.get(
-    'SECURE_COOKIES', 'true' if not DEBUG else 'false',
-).strip().lower() in ('1', 'true', 'yes', 'on')
+#   * CSRF_COOKIE_DOMAIN='.talentbro.in' does not domain-match localhost, so the
+#     browser drops the csrf and session cookies outright and the login session
+#     would not survive the redirect.
+SECURE_COOKIES = os.environ.get('SECURE_COOKIES', 'true').strip().lower() in (
+    '1', 'true', 'yes', 'on',
+)
+
+# The `.strip() or ...` matters: a bare `COOKIE_DOMAIN=` line in .env sets the
+# variable to an empty string, which is not the same as leaving it unset —
+# `os.environ.get('COOKIE_DOMAIN', '.talentbro.in')` would return '' and emit a
+# valueless `Domain=` attribute, which browsers discard, quietly giving us the
+# host-only cookie this setting exists to prevent.
+_cookie_domain = os.environ.get('COOKIE_DOMAIN', '').strip() or '.talentbro.in'
 
 # Parent-domain scoping only applies to the production cookie set; on localhost
-# a scoped cookie is rejected outright, so leave the domain unset in dev.
-CSRF_COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN', '.talentbro.in') if SECURE_COOKIES else None
+# such a cookie is a domain mismatch and the browser rejects it.
+CSRF_COOKIE_DOMAIN = _cookie_domain if SECURE_COOKIES else None
 CSRF_COOKIE_SECURE = SECURE_COOKIES
 SESSION_COOKIE_DOMAIN = CSRF_COOKIE_DOMAIN
 SESSION_COOKIE_SECURE = SECURE_COOKIES
 
-# CSRF_COOKIE_HTTPONLY must stay False: the SPA reads `csrftoken` out of
-# document.cookie and echoes it back in the X-CSRFToken header. Setting it True
-# reintroduces the "CSRF token ... incorrect" failure on every POST.
+# CSRF_COOKIE_HTTPONLY may be set True in production: /api/auth/csrf/ hands the
+# token to the SPA in the response body, so no page script needs to read the
+# cookie. Left False so a client that still reads document.cookie keeps working.
 
 # TLS is terminated by the reverse proxy in front of this app, so the socket
 # Django sees is plain http. Without this, request.is_secure() is False even for
