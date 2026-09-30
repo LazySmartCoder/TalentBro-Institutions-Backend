@@ -196,6 +196,21 @@ SESSION_COOKIE_AGE = 60 * 60 * 24 * 14  # 14 days
 SESSION_EXPIRE_AT_BROWSER_CLOSE = False  # survive browser restarts
 SESSION_SAVE_EVERY_REQUEST = True  # sliding: extend the window on every visit
 
+# The SPA (ins.talentbro.in) calls the API (ins-api.talentbro.in) cross-origin.
+# The frontend reads `csrftoken` out of `document.cookie` and echoes it back in
+# the X-CSRFToken header (see Frontend/src/lib/api.ts), so the cookie has to be
+# scoped to the shared parent domain — a host-only cookie on ins-api would be
+# invisible to the page's own JS and every POST would fail CSRF. The two hosts
+# are same-site (both under talentbro.in), so the default SameSite=Lax still
+# rides along on the fetch; only the domain scope and the Secure flag matter.
+# Set SECURE_COOKIES=1 in .env once the API is served over https.
+SECURE_COOKIES = os.environ.get('SECURE_COOKIES', '0').strip() == '1'
+
+CSRF_COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN', '.talentbro.in')
+CSRF_COOKIE_SECURE = SECURE_COOKIES
+SESSION_COOKIE_DOMAIN = CSRF_COOKIE_DOMAIN
+SESSION_COOKIE_SECURE = SECURE_COOKIES
+
 
 # Internationalization
 # https://docs.djangoproject.com/en/6.0/topics/i18n/
