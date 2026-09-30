@@ -241,13 +241,26 @@ SESSION_SAVE_EVERY_REQUEST = True  # sliding: extend the window on every visit
 # invisible to the page's own JS and every POST would fail CSRF. The two hosts
 # are same-site (both under talentbro.in), so the default SameSite=Lax still
 # rides along on the fetch; only the domain scope and the Secure flag matter.
-# Set SECURE_COOKIES=1 in .env once the API is served over https.
-SECURE_COOKIES = os.environ.get('SECURE_COOKIES', '0').strip() == '1'
+SECURE_COOKIES = True
 
 CSRF_COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN', '.talentbro.in')
 CSRF_COOKIE_SECURE = SECURE_COOKIES
 SESSION_COOKIE_DOMAIN = CSRF_COOKIE_DOMAIN
 SESSION_COOKIE_SECURE = SECURE_COOKIES
+
+# CSRF_COOKIE_HTTPONLY must stay False: the SPA reads `csrftoken` out of
+# document.cookie and echoes it back in the X-CSRFToken header. Setting it True
+# reintroduces the "CSRF token ... incorrect" failure on every POST.
+
+# TLS is terminated by the reverse proxy in front of this app, so the socket
+# Django sees is plain http. Without this, request.is_secure() is False even for
+# genuine https traffic, which breaks the CSRF referer check and any
+# SECURE_SSL_REDIRECT added later. Must be a two-value tuple - Django raises
+# ImproperlyConfigured otherwise (django/http/request.py:311).
+# Security note: this trusts the header, so it is only safe while the app is
+# reachable *through* the proxy and not directly. If the uvicorn port is
+# exposed to the internet, a client can spoof X-Forwarded-Proto: https.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 
 # Internationalization
