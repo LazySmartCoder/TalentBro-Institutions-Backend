@@ -183,6 +183,13 @@ CORS_ALLOWED_ORIGINS = [
     'http://127.0.0.1:8080',
     'http://localhost:8081',
     'http://127.0.0.1:8081',
+    # Django serving the admin itself (runserver default port), so a SPA on
+    # :8080 can talk to an API on :8000 during local development.
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    'http://[::1]:8000',
+    'http://[::1]:8080',
+    'http://[::1]:8081',
 ]
 CORS_ALLOW_CREDENTIALS = True
 
@@ -195,6 +202,11 @@ CSRF_TRUSTED_ORIGINS = [
     'http://127.0.0.1:8080',
     'http://localhost:8081',
     'http://127.0.0.1:8081',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    'http://[::1]:8000',
+    'http://[::1]:8080',
+    'http://[::1]:8081',
 ]
 
 
@@ -241,9 +253,24 @@ SESSION_SAVE_EVERY_REQUEST = True  # sliding: extend the window on every visit
 # invisible to the page's own JS and every POST would fail CSRF. The two hosts
 # are same-site (both under talentbro.in), so the default SameSite=Lax still
 # rides along on the fetch; only the domain scope and the Secure flag matter.
-SECURE_COOKIES = True
+# True in production (https only, cookies scoped to the shared parent domain so
+# the SPA can read csrftoken). False for local development over plain http:
+#   * CSRF_COOKIE_SECURE=True makes the browser refuse to store/send `csrftoken`
+#     on http://localhost, so every POST died with
+#     "Forbidden (CSRF cookie not set.)" - the cookie never reached Django.
+#   * CSRF_COOKIE_DOMAIN='.talentbro.in' is a domain mismatch on localhost, so
+#     the browser would drop both the csrf and session cookies anyway, and the
+#     login session would not survive the redirect.
+# Locally the cookies therefore stay host-only and non-secure. Override either
+# way with SECURE_COOKIES=true|false in .env, so a deploy that still runs with
+# DEBUG=True can force the production behaviour back on.
+SECURE_COOKIES = os.environ.get(
+    'SECURE_COOKIES', 'true' if not DEBUG else 'false',
+).strip().lower() in ('1', 'true', 'yes', 'on')
 
-CSRF_COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN', '.talentbro.in')
+# Parent-domain scoping only applies to the production cookie set; on localhost
+# a scoped cookie is rejected outright, so leave the domain unset in dev.
+CSRF_COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN', '.talentbro.in') if SECURE_COOKIES else None
 CSRF_COOKIE_SECURE = SECURE_COOKIES
 SESSION_COOKIE_DOMAIN = CSRF_COOKIE_DOMAIN
 SESSION_COOKIE_SECURE = SECURE_COOKIES
