@@ -7,10 +7,13 @@ import os
 import random
 import re
 import sqlite3
+import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -19,17 +22,22 @@ from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.db import transaction
 from django.db.models import Avg, BooleanField, Case, Count, F, Q, Sum, Value, When
 from django.db.models.functions import Coalesce, Length
-from django.http import HttpResponse, JsonResponse
+from django.http import FileResponse, HttpResponse, JsonResponse
 from django.utils import timezone
+from django.utils.crypto import get_random_string
 from django.utils.dateparse import parse_date
+from django.utils.text import slugify
+from django.urls import reverse
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from .company_insights import company_context_block
 from .coursera_scraper import COURSERA_DEFAULT_QUERY, get_courses
+from .resume_pdf import render_resume_pdf
 from .weakness_segments import collect_weakness_segments
 from .gemini_cost import record_cost_incurred
 
@@ -59,8 +67,10 @@ from .models import (
     ChatSession,
     CandidateRoadmap,
     ClientProfile,
+    MOBILE_NUMBER_VALIDATOR,
     CommunicationTraining,
     Company,
+    COMPANY_TIER_CHOICES,
     Drive,
     EnglishTraining,
     EnglishTrainingSession,
@@ -72,6 +82,7 @@ from .models import (
     LANGUAGE_CHOICES,
     MockInterview,
     MOCK_INTERVIEW_ANALYSIS_DIMENSIONS,
+    MOCK_INTERVIEW_ANALYSIS_PANELISTS,
     MOCK_INTERVIEW_STATUS_ACTIVE,
     MOCK_INTERVIEW_STATUS_COMPLETED,
     MOCK_INTERVIEW_STATUS_INSUFFICIENT,
@@ -82,6 +93,10 @@ from .models import (
     NOTIFICATION_SENDER_PLATFORM,
     NOTIFICATION_SENDER_PLACEMENT_CELL,
     PLACEMENT_STATUS_CHOICES,
+    PLACEMENT_MODE_CHOICES,
+    OFFER_STATUS_CHOICES,
+    DRIVE_MODE_CHOICES,
+    WORK_MODE_CHOICES,
     ProfileUpdateSummary,
     RECRUITMENT_STATUS_CHOICES,
     ROADMAP_STATUS_ACTIVE,
@@ -613,6 +628,157 @@ def _json_body(request):
     return data if isinstance(data, dict) else None
 
 
+# Default page size for the self-training history lists. A student who practises
+# weekly accumulates sessions without bound, so each history screen asks for this
+# many rows and pulls the next page as the reader scrolls. Generous on purpose:
+# it is a ceiling on transfer and parse cost, not a target to hit.
+HISTORY_PAGE_DEFAULT = 50
+HISTORY_PAGE_MAX = 200
+
+
+def _history_page_bounds(request, default=HISTORY_PAGE_DEFAULT, maximum=HISTORY_PAGE_MAX):
+    """Read ``?limit=&offset=`` and clamp both to a sane window.
+
+    Returns ``(limit, offset)``. A missing, negative or unparseable value falls
+    back to the default rather than erroring, so an old client that sends neither
+    parameter still gets a working, bounded first page.
+    """
+    try:
+        limit = int(request.GET.get('limit', default))
+    except (TypeError, ValueError):
+        limit = default
+    limit = max(1, min(limit, maximum))
+
+    try:
+        offset = int(request.GET.get('offset', 0))
+    except (TypeError, ValueError):
+        offset = 0
+    return limit, max(0, offset)
+
+
+def _history_page_response(rows, payload_for, limit, offset, total, summary=None, rollup=None):
+    """Build the paged history response body.
+
+    ``rows`` is the already-ordered queryset for the whole record, ``payload_for``
+    serialises one row. Slicing in Python rather than in the query keeps every
+    history endpoint shaped identically; the rows are small and a student's own
+    record is bounded in practice, so the saving would not repay the N+1 that
+    building the page outside the main query would cost.
+
+    ``summary`` is an optional dict of whole-record aggregates. Endpoints whose UI
+    shows averages or a first-to-latest trend pass it in so those numbers describe
+    every session rather than only the rows in this page, which would otherwise
+    change as the reader scrolls.
+
+    ``rollup`` is an optional compact projection of every row, for endpoints whose
+    UI derives cross-session figures client-side. Same reasoning: the derivation
+    needs the whole record, and the page only carries the visible window of it.
+    """
+    window = rows[offset:offset + limit]
+    body = {
+        'sessions': [payload_for(row) for row in window],
+        'has_more': offset + limit < total,
+        'total': total,
+        'offset': offset,
+        'limit': limit,
+    }
+    if summary is not None:
+        body['summary'] = summary
+    if rollup is not None:
+        body['rollup'] = rollup
+    return body
+
+
+def _practice_rollup(rows):
+    """A compact whole-record projection of the practice modules' shared fields.
+
+    The APLR, Basic Math, DSA, Situational and Technical screens all derive the
+    same handful of numbers from the same handful of fields: status, points
+    awarded, star rating, category and creation time. Under paging they cannot
+    read those off the loaded rows, or the stat chips and per-category insights
+    would silently describe only the first page.
+
+    Sending the five fields for every session (rather than a precomputed
+    aggregate) keeps those derivations on the client exactly as they were, and
+    costs a few short values per row instead of a full session payload.
+    """
+    return [
+        {
+            'status': row.status,
+            'points_awarded': row.points_awarded,
+            'star_rating': row.star_rating,
+            'category': row.category,
+            'created_at': row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+def _as_number(value):
+    """Return ``value`` as a float, or None if it is not a usable number.
+
+    Analysis rows mix scores, counts and free-text prose, so any field reached
+    by a whole-record average has to be checked rather than assumed numeric.
+    Booleans are excluded on purpose: they are ints in Python but are never a
+    meaningful score.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _analyzed_history_summary(
+    rows, analyzed_when, score_of, extra_keys=(), mistake_of=None, skip_keys=()
+):
+    """Aggregate an entire history record for a summary panel.
+
+    Shared by the Communication and English history endpoints, which both show
+    "averages across all analysed sessions" plus a first-session to latest-session
+    trend. Under paging those figures have to come from the whole record, not the
+    visible page, or they would drift every time another page loads.
+    """
+    analyzed = [row for row in rows if analyzed_when(row)]
+    count = len(analyzed)
+    scores = [score_of(row) for row in analyzed]
+
+    summary = {
+        'analyzed_count': count,
+        'overall': round(sum(scores) / count) if count else 0,
+        'best': max(scores) if count else 0,
+        # `rows` is newest-first, so the analysed head is the latest session and
+        # the analysed tail is the very first one.
+        'latest': scores[0] if count else 0,
+        'first': scores[-1] if count else 0,
+        'last_practiced_at': (
+            analyzed[0].finalized_at.isoformat() if analyzed and analyzed[0].finalized_at else None
+        ),
+        'averages': {},
+    }
+    for key in extra_keys:
+        # The overall score already has its own field; the panels only chart the
+        # per-dimension breakdowns, so it is left out of the averages map.
+        if key in skip_keys:
+            continue
+        # Coerce defensively rather than trusting the caller to pass numeric
+        # fields. A text field slipped into this list used to raise ValueError
+        # and turn the whole history endpoint into a 500, which is a much worse
+        # failure than one missing bar on the chart.
+        values = []
+        for row in analyzed:
+            value = _as_number(getattr(row, key, None))
+            if value is not None:
+                values.append(value)
+        if not values:
+            continue
+        summary['averages'][key] = round(sum(values) / len(values))
+    if mistake_of is not None:
+        summary['total_mistakes'] = sum(mistake_of(row) for row in analyzed)
+    return summary
+
+
 # Common English stopwords/fillers that add little meaning to a 4-word summary.
 _STOPWORDS = {
     'a', 'an', 'the', 'and', 'or', 'but', 'so', 'for', 'of', 'to', 'in', 'on',
@@ -990,10 +1156,10 @@ PROFILE_FIELD_MAP = {
     'time_spent': 'time_spent',
     'personal_email': 'personal_email',
     'placement_status': 'placement_status',
-    # placement_eligible is deliberately absent: it is a nullable staff
-    # override, and letting the AI pin it would freeze the student as eligible
-    # (or ineligible) regardless of their readiness score. The AI may reason
-    # about eligibility, but only the placement office writes the override.
+    # placement_eligible is deliberately absent, and no longer exists on the
+    # model: it is derived from the readiness score at read time, so there is
+    # nothing to pin. The AI may reason about readiness, but the score itself
+    # comes from the platform's own activity signals.
     'preferred_language': 'preferred_language',
     # 'bio' is candidate-editable, but deliberately not in PROFILE_STRING_FIELDS:
     # the AI must not overwrite the LinkedIn headline we sync into it.
@@ -1002,6 +1168,10 @@ PROFILE_FIELD_MAP = {
 PROFILE_LIST_FIELDS = [
     'skills', 'certifications', 'projects', 'internships',
     'preferred_roles', 'preferred_locations',
+    # Candidate-authored list, like the others above it: the AI is deliberately
+    # not given write access (see PROFILE_LIST_FIELDS_UPDATE), so what the
+    # student typed about their activities survives.
+    'extracurricular_activities',
 ]
 
 GENDER_PAYLOAD_VALUES = {key for key, _ in GENDER_CHOICES}
@@ -1303,53 +1473,49 @@ PERF_NEUTRAL_SCORE = 50
 # drive pool and student record resolves it through the two helpers below.
 PLACEMENT_READY_SCORE = 40
 
-# CandidateProfile.placement_eligible is a *nullable staff override*, not a
-# stored verdict: null means "no opinion, follow the readiness score", while
-# True/False pin the student whatever their score says. The effective value is
+# A candidate is placement eligible when, and only when, they have a readiness
+# score that clears the bar AND they have actually started the process:
 #
-#     placement_eligible if it is not null else readiness_score >= 40
+#     readiness_score IS NOT NULL
+#     AND readiness_score >= 40
+#     AND placement_status != 'not_started'
 #
-# A candidate with no readiness activity at all has readiness_score=None, and is
-# scored at PERF_NEUTRAL_SCORE for this purpose so that starting out on the
-# platform never disqualifies them — the same "we have nothing to judge them on"
-# answer the scorer already gives. Nothing is ever written back from the score:
-# these are pure read-time helpers, so the twenty-odd places that refresh
-# readiness need no changes and no candidate row is churned.
+# There is no staff override and no CGPA-on-record gate. A candidate with no
+# readiness activity at all has readiness_score=None and is NOT eligible: the
+# product no longer treats "we have nothing to judge them on" as a pass, so an
+# untouched profile sits in the same bucket as a low score until they actually
+# generate one.
+#
+# 'not_started' is treated as ineligible in its own right, whatever the score
+# says. Clearing the readiness bar describes what a student is capable of, not
+# whether they are in the running; someone who has not begun applying is not yet
+# a candidate for anything, so counting them would inflate every eligible figure
+# with students no recruiter could actually shortlist.
+#
+# Nothing is written back from any of this - these are pure read-time helpers, so
+# the twenty-odd places that refresh readiness need no changes and no candidate
+# row is churned.
 
 
 def _effective_eligible(candidate):
-    """Resolve one CandidateProfile (or anything with the two attributes)."""
-    override = getattr(candidate, 'placement_eligible', None)
-    if override is not None:
-        return bool(override)
+    """Resolve one CandidateProfile (or anything with the needed attributes)."""
+    if getattr(candidate, 'placement_status', None) == 'not_started':
+        return False
     score = getattr(candidate, 'readiness_score', None)
-    if score is None:
-        score = PERF_NEUTRAL_SCORE
-    return score >= PLACEMENT_READY_SCORE
+    return score is not None and score >= PLACEMENT_READY_SCORE
 
 
-def _with_effective_eligibility(queryset):
-    """Annotate ``effective_eligible`` so it can be filtered/aggregated in SQL.
+def _eligible_candidates(queryset):
+    """Narrow a candidate queryset to the placement-eligible ones.
 
     Mirrors :func:`_effective_eligible` exactly; the Python version is for the
-    call sites that already iterate candidates in Python.
+    call sites that already iterate candidates in Python. Keeping the two in step
+    is what stops a count and a badge from disagreeing about the same student.
     """
-    # A candidate with no readiness activity has readiness_score=None and is
-    # scored at PERF_NEUTRAL_SCORE for this purpose, so they clear the bar
-    # whenever that neutral score does. This spells the rule out in Q objects
-    # rather than comparing a Coalesce() to PLACEMENT_READY_SCORE directly:
-    # Django's Func subclasses don't implement comparison operators, so that
-    # form raises TypeError while the module is being imported.
-    ready = Q(readiness_score__gte=PLACEMENT_READY_SCORE)
-    if PERF_NEUTRAL_SCORE >= PLACEMENT_READY_SCORE:
-        ready = Q(readiness_score__isnull=True) | ready
-    return queryset.annotate(
-        effective_eligible=Case(
-            When(placement_eligible__isnull=False, then=F('placement_eligible')),
-            default=ready,
-            output_field=BooleanField(),
-        )
-    )
+    return queryset.filter(
+        readiness_score__isnull=False,
+        readiness_score__gte=PLACEMENT_READY_SCORE,
+    ).exclude(placement_status='not_started')
 
 # How much of a score survives at zero coverage. A pillar backed by a single
 # signal keeps 70% (self-training) / 60% (mock interview) of its distance from
@@ -1363,7 +1529,7 @@ PERF_MOCK_SHRINK_FLOOR = 0.6
 # "not enough evidence" — no analysis, no score, no notification and no
 # contribution to the mock pillar, so a silent session can never be handed an
 # invented 48/100.
-MOCK_INTERVIEW_MIN_USER_TURNS = 3
+MOCK_INTERVIEW_MIN_USER_TURNS = 2
 
 # ...and the evaluation itself must back at least this many rubric dimensions
 # with real, transcript-grounded evidence before any number is published.
@@ -1373,6 +1539,11 @@ MOCK_MIN_SCORED_DIMENSIONS = 3
 # evidence is a quoted, specific observation; "not addressed" and "no evidence"
 # notes are one or two words and are ignored instead of being scored.
 MOCK_EVIDENCE_MIN_WORDS = 8
+
+# Longest per-panelist improvement line kept on the analysis. A one-liner that
+# runs long has stopped being a one-liner, so it is trimmed to its first
+# sentence and then hard-capped rather than stored as a paragraph.
+MOCK_IMPROVEMENT_MAX_CHARS = 200
 
 # Resolved questions (solved + gave up) a one-question-per-chat module needs
 # before its score counts at all. A single lucky answer is not a module score.
@@ -2067,9 +2238,9 @@ PROFILE_CHOICE_FIELDS = {
 PROFILE_INT_FIELDS = ['start_year', 'end_year']
 PROFILE_DECIMAL_FIELDS = ['cgpa', 'expected_ctc']
 PROFILE_DATE_FIELDS = ['date_of_birth']
-# Intentionally empty: placement_eligible used to be the only boolean the AI
-# could write, and it is now a nullable staff override driven by the readiness
-# score. Keeping it here would let the AI pin a student's eligibility forever.
+# Intentionally empty: the only boolean the AI used to be able to write,
+# placement_eligible, has been removed from the model - it is now derived from the
+# readiness score at read time. Nothing here may write a stored eligibility flag.
 PROFILE_BOOL_FIELDS: list = []
 PROFILE_LIST_FIELDS_UPDATE = [
     'skills', 'certifications', 'projects', 'internships',
@@ -2310,6 +2481,112 @@ def _gd_panelists_via_gemini(user=None):
     if len({p['name'] for p in cleaned}) != 6:
         return None
     return cleaned
+
+
+COMPANY_AI_INFO_PROMPT = (
+    'You are a placement-cell research assistant for an Indian college. Given a '
+    'company, write ONE profile block describing what a placement student should '
+    'know about it.\n\n'
+    'Reply with JSON only, in exactly this shape - one object, no wrapper, no '
+    'extra keys:\n'
+    '{"name": string, "short_desc": string, "known_for": string, "big_desc": string}\n\n'
+    'Field rules:\n'
+    '- "name": the company\'s common name, as students would recognise it.\n'
+    '- "short_desc": ONE sentence, max 25 words, plain and factual.\n'
+    '- "known_for": a short phrase naming what the company is best known for '
+    '(its products, services or reputation), max 15 words.\n'
+    '- "big_desc": 2-3 sentences, max 70 words, covering what it does, the '
+    'kind of roles it hires for and its standing as an employer.\n\n'
+    'Write about the company as a whole, not only its campus drive. Use plain '
+    'sentences, no bullet points, no markdown and no preamble. If you are '
+    'unsure of a detail, describe only what you are confident about rather than '
+    'inventing numbers, rankings or awards.'
+)
+
+
+# Company pks with a Gemini profile request already in flight. Two students
+# opening the same not-yet-written company at the same moment would otherwise
+# each spawn a thread and both blocks would be appended.
+_AI_INFO_INFLIGHT = set()
+_AI_INFO_INFLIGHT_LOCK = threading.Lock()
+
+
+def _generate_company_ai_info(company, user=None):
+    """Ask Gemini for one company profile block and store it on the row.
+
+    Runs on a daemon thread so registering a company stays instant: the row is
+    saved first, the API responds immediately with the company as the staff typed
+    it, and the AI blurb lands in company_ai_info a moment later for the next
+    read. A missing key, a timeout or a malformed reply is logged and skipped -
+    the company is already recorded either way, so an AI outage must never be
+    able to fail a registration.
+
+    Only one request per company runs at a time; concurrent callers get an
+    immediate no-op rather than a duplicate block.
+    """
+    if company.pk is None:
+        return
+    with _AI_INFO_INFLIGHT_LOCK:
+        if company.pk in _AI_INFO_INFLIGHT:
+            return
+        _AI_INFO_INFLIGHT.add(company.pk)
+
+    def _work():
+        # Wrapped whole: this runs on a background thread, so an unexpected
+        # exception would otherwise print a stack trace with nobody watching.
+        # The company row is already saved, so there is nothing to recover.
+        try:
+            _store()
+        except Exception:  # noqa: BLE001 - a background enrichment must never escalate
+            logger.exception(
+                'Company AI profile failed for %r; the company is unaffected.',
+                company.company_name,
+            )
+        finally:
+            # Released even on failure, so a company is not permanently skipped
+            # after one bad Gemini reply.
+            with _AI_INFO_INFLIGHT_LOCK:
+                _AI_INFO_INFLIGHT.discard(company.pk)
+
+    def _store():
+        reply = _model_json(
+            [{'role': 'user', 'parts': [{'text': (
+                f'Company name: {company.company_name}\n'
+                f'Industry: {company.industry or "not specified"}\n'
+                f'Existing description: {company.company_description or "none provided"}\n'
+                f'Work location: {company.work_location or "not specified"}'
+            )}]}],
+            COMPANY_AI_INFO_PROMPT,
+            temperature=0.3,
+            user=user,
+        )
+        # Tolerate a wrapper list: the prompt asks for a bare object, but a model
+        # that answers with [{"name": ...}] is close enough to salvage.
+        if isinstance(reply, list) and reply:
+            reply = reply[0]
+        if not isinstance(reply, dict):
+            logger.warning(
+                'Gemini returned no usable company profile for %r.',
+                company.company_name,
+            )
+            return
+        block = {
+            key: str(reply.get(key) or '').strip()[:1200]
+            for key in Company.AI_INFO_KEYS
+        }
+        if not block['name']:
+            logger.warning(
+                'Gemini company profile for %r had no name; not stored.',
+                company.company_name,
+            )
+            return
+        # Append rather than replace, so a re-run adds a fresh block instead of
+        # destroying what is already there.
+        company.company_ai_info = [*(company.company_ai_info or []), block]
+        company.save(update_fields=['company_ai_info', 'updated_at'])
+        logger.info('Stored Gemini company profile for %r.', company.company_name)
+
+    threading.Thread(target=_work, name='company-ai-info', daemon=True).start()
 
 
 def gd_panelists(request):
@@ -3058,11 +3335,32 @@ def _gd_record_payload(gd, include_full=False):
 
 @require_GET
 def gd_history(request):
-    """List a student's completed GD rounds, newest first."""
+    """List a student's completed GD rounds, newest first. Paged."""
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
-    rounds = GdTraining.objects.filter(user=request.user).order_by('-created_at')
-    return JsonResponse({'sessions': [_gd_record_payload(g) for g in rounds]})
+    rounds = list(
+        GdTraining.objects.filter(user=request.user).order_by('-created_at', '-pk')
+    )
+    limit, offset = _history_page_bounds(request)
+    return JsonResponse(
+        _history_page_response(
+            rounds,
+            _gd_record_payload,
+            limit,
+            offset,
+            len(rounds),
+            # The GD report plots an "every round so far" progress line, so it
+            # needs one score per round for the whole record, not just the rows a
+            # history page has loaded.
+            rollup=[
+                {
+                    'overall_score': row.overall_score,
+                    'created_at': row.created_at.isoformat(),
+                }
+                for row in rounds
+            ],
+        )
+    )
 
 
 @require_GET
@@ -3923,11 +4221,12 @@ def _candidate_profile_data(profile):
         'linkedin_url': profile.linkedin_url,
         'github_url': profile.github_url,
         'portfolio_url': profile.portfolio_url,
-        'skills': profile.skills,
+        'skills': profile.skills or [],
         'certifications': profile.certifications,
         'projects': profile.projects,
         'internships': profile.internships,
-        'preferred_roles': profile.preferred_roles,
+        'extracurricular_activities': profile.extracurricular_activities or [],
+        'preferred_roles': profile.preferred_roles or [],
         'preferred_locations': profile.preferred_locations,
         'preferred_language': profile.preferred_language,
         'expected_ctc': (
@@ -3940,7 +4239,6 @@ def _candidate_profile_data(profile):
         'placement_status': profile.placement_status,
         # Resolved through the readiness rule; see _effective_eligible.
         'placement_eligible': _effective_eligible(profile),
-        'placement_eligible_override': profile.placement_eligible,
         'cost_incurred': float(profile.cost_incurred),
         'first_name': profile.first_name,
         'middle_name': profile.middle_name,
@@ -3990,6 +4288,49 @@ MAX_BIO_LENGTH = 500
 _LINKEDIN_HEADLINE_KEYS = ('headline', 'subtitle', 'tagline')
 
 
+def scrape_linkedin_profile(linkedin_url):
+    """Run the Apify LinkedIn scraper and return the whole scraped profile.
+
+    Returns ``(item, error)`` where ``item`` is the actor's raw dataset item as a
+    dict (or None on failure) and ``error`` is a human-readable reason or None.
+    The item carries every section the actor collects — headline, about,
+    experiences, educations, certifications, skills, languages, projects and the
+    rest — so callers that only need one slice of it can pick their own fields out
+    instead of a second, differently-shaped scrape.
+    """
+    token = settings.APIFY_TOKEN
+    if not token:
+        return None, "APIFY_TOKEN is not configured. Set it in the Backend/.env file."
+
+    actor = settings.APIFY_LINKEDIN_ACTOR
+    try:
+        response = requests.post(
+            f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items",
+            params={'token': token},
+            json={'profiles': [linkedin_url]},
+            timeout=60,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return None, f'Apify request failed: {exc}'
+
+    try:
+        data = response.json()
+    except ValueError:
+        return None, 'Apify returned a response that was not JSON.'
+
+    # The endpoint returns the dataset items as a list, but an error envelope
+    # with a 200 status comes back as a dict, so only a list of results is usable.
+    if not isinstance(data, list):
+        return None, 'Apify returned no data for that LinkedIn profile.'
+    if not data:
+        return None, 'Apify returned no data for that LinkedIn profile.'
+    if not isinstance(data[0], dict):
+        return None, 'Apify returned no data for that LinkedIn profile.'
+
+    return data[0], None
+
+
 def get_linkedin_profile(linkedin_url):
     """Fetch a LinkedIn profile's photo and headline via the Apify scraper.
 
@@ -3999,38 +4340,10 @@ def get_linkedin_profile(linkedin_url):
     and the caller should carry on: a missing photo or headline is never worth
     failing a profile save over.
     """
-    token = settings.APIFY_TOKEN
-    if not token:
-        return None, None, "APIFY_TOKEN is not configured. Set it in the Backend/.env file."
+    item, error = scrape_linkedin_profile(linkedin_url)
+    if error is not None:
+        return None, None, error
 
-    try:
-        response = requests.post(
-            "https://api.apify.com/v2/acts/"
-            "calm_builder~linkedin-profile-scraper/"
-            "run-sync-get-dataset-items",
-            params={'token': token},
-            json={'profiles': [linkedin_url]},
-            timeout=60,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        return None, None, f'Apify request failed: {exc}'
-
-    try:
-        data = response.json()
-    except ValueError:
-        return None, None, 'Apify returned a response that was not JSON.'
-
-    # The endpoint returns the dataset items as a list, but an error envelope
-    # with a 200 status comes back as a dict, so only a list of results is usable.
-    if not isinstance(data, list):
-        return None, None, 'Apify returned no data for that LinkedIn profile.'
-    if not data:
-        return None, None, 'Apify returned no data for that LinkedIn profile.'
-    if not isinstance(data[0], dict):
-        return None, None, 'Apify returned no data for that LinkedIn profile.'
-
-    item = data[0]
     avatar_url = str(item.get('profilePictureUrl') or '').strip()
     headline = ''
     for key in _LINKEDIN_HEADLINE_KEYS:
@@ -4121,6 +4434,183 @@ def linkedin_profile_fetch(request):
 
     return JsonResponse(
         {'ok': True, 'saved': saved, 'avatar_url': avatar_url, 'bio': bio}
+    )
+
+
+# Sections of the scraped LinkedIn item worth pulling out by name for the log, in
+# resume order. Key names differ between the LinkedIn actors (and drift between
+# actor versions), so each section lists the spellings in use and falls through to
+# the next one rather than dropping a section that is really there under another
+# label. Which sections actually come back depends on the actor — see
+# settings.APIFY_LINKEDIN_ACTOR.
+_LINKEDIN_RESUME_SECTIONS = (
+    ('summary', ('headline', 'subtitle', 'tagline', 'occupation')),
+    ('about', ('about', 'aboutText', 'summaryText')),
+    ('experiences', ('experience', 'experiences', 'positionGroups', 'workExperiences')),
+    ('educations', ('education', 'educations', 'educationsList')),
+    ('certifications', ('certifications', 'certificationsList', 'licenseAndCertification')),
+    ('projects', ('projects', 'projectsList')),
+    ('skills', ('skills', 'skillsList')),
+    ('languages', ('languages', 'languageList')),
+    ('publications', ('publications', 'publicationList', 'articles')),
+    ('honors', ('honors', 'honorsList', 'awards')),
+    ('volunteerExperiences', ('volunteerExperience', 'volunteerExperiences', 'volunteering')),
+    ('courses', ('courses', 'coursesList')),
+    ('recommendations', ('recommendations', 'recommendationList')),
+    ('groups', ('groups', 'groupList')),
+)
+
+# Flat identity lines, kept apart from the list sections above since they are
+# single strings rather than collections of entries.
+_LINKEDIN_RESUME_FIELDS = (
+    'fullName',
+    'location',
+    'country',
+    'currentCompany',
+    'currentSchool',
+    'profilePictureUrl',
+    'connections',
+    'followers',
+    'websites',
+)
+
+
+def _resume_pdf_path(user):
+    """Where a candidate's generated resume PDF lives.
+
+    Keyed by user id rather than by candidate name, so one candidate can never
+    overwrite another's file and a name change does not orphan the old one. Each
+    build overwrites, so a candidate never accumulates stale copies.
+    """
+    return Path(settings.MEDIA_ROOT) / 'resumes' / str(user.pk) / 'resume.pdf'
+
+
+def _resume_filename(profile):
+    """The name the file is offered under, so the download is recognisable."""
+    name = slugify((profile.full_name or '').strip()) or 'candidate'
+    return f'{name}-resume.pdf'
+
+
+@require_POST
+def resume_build(request):
+    """Scrape the signed-in candidate's LinkedIn profile and log everything.
+
+    Expects an optional ``{"linkedin_url": "..."}`` and falls back to the URL saved
+    on the candidate's profile. Logs the full scraped LinkedIn profile alongside the
+    candidate's own platform profile so the two can be compared while we work out
+    how a resume gets assembled from them. Nothing is written to the database.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    data = _json_body(request)
+    if data is None:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    profile, _created = CandidateProfile.objects.get_or_create(user=request.user)
+
+    linkedin_url = str(data.get('linkedin_url') or '').strip() or profile.linkedin_url
+    if not linkedin_url:
+        return JsonResponse(
+            {'ok': False, 'detail': 'Add your LinkedIn profile link first.'}, status=400
+        )
+    if not _LINKEDIN_IN_RE.search(linkedin_url):
+        return JsonResponse(
+            {'ok': False, 'detail': 'That does not look like a LinkedIn profile link.'},
+            status=400,
+        )
+
+    item, error = scrape_linkedin_profile(linkedin_url)
+    if error is not None:
+        logger.warning('Resume build: LinkedIn scrape failed for user %s: %s',
+                       request.user.pk, error)
+        return JsonResponse({'ok': False, 'detail': error}, status=400)
+
+    # Split the actor's raw item into the resume sections, the flat identity lines
+    # and everything else, so a section that is present under an unrecognised key
+    # still shows up in the "other fields" log line instead of vanishing.
+    known_keys = {key for _name, keys in _LINKEDIN_RESUME_SECTIONS for key in keys}
+    resume = {}
+    for name, keys in _LINKEDIN_RESUME_SECTIONS:
+        for key in keys:
+            if item.get(key) not in (None, '', [], {}):
+                resume[name] = item[key]
+                break
+    identity = {key: item[key] for key in _LINKEDIN_RESUME_FIELDS if item.get(key)}
+    other = {
+        key: value for key, value in item.items()
+        if key not in known_keys and key not in identity
+    }
+
+    platform_profile = _profile_payload(request.user, profile)
+
+    logger.info(
+        '=== Resume build for user %s (%s) ===\n'
+        'LinkedIn URL: %s\n'
+        'Apify actor: %s\n'
+        '--- LinkedIn sections found ---\n%s\n'
+        '--- LinkedIn sections ---\n%s\n'
+        '--- LinkedIn identity fields ---\n%s\n'
+        '--- LinkedIn other scraped fields ---\n%s\n'
+        '--- TalentBro platform profile ---\n%s',
+        request.user.pk,
+        request.user.email,
+        linkedin_url,
+        settings.APIFY_LINKEDIN_ACTOR,
+        json.dumps(sorted(resume), indent=2),
+        json.dumps(resume, indent=2, default=str, ensure_ascii=False),
+        json.dumps(identity, indent=2, default=str, ensure_ascii=False),
+        json.dumps(other, indent=2, default=str, ensure_ascii=False),
+        json.dumps(platform_profile, indent=2, default=str, ensure_ascii=False),
+    )
+
+    return JsonResponse({
+        'ok': True,
+        'linkedin_url': linkedin_url,
+        'sections': sorted(resume),
+        'logged': True,
+        'pdf_url': _render_resume_for_user(request.user, profile, item),
+    })
+
+
+def _render_resume_for_user(user, profile, linkedin_item):
+    """Write the candidate's resume PDF and return its download path.
+
+    Rendering is kept out of the request's success path as far as it can be: a
+    failure here raises, so the caller reports a 500 rather than telling the
+    student their resume is ready when no file was written.
+    """
+    pdf = render_resume_pdf(_candidate_profile_data(profile), linkedin_item)
+    path = _resume_pdf_path(user)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(pdf)
+    return reverse('TalentBroIns:resume-download')
+
+
+@require_GET
+def resume_download(request):
+    """Serve the signed-in candidate's generated resume PDF.
+
+    The file is read through this view rather than exposed under MEDIA_URL
+    because a resume is personal data: the path is per-user, and serving it
+    directly would let anyone who guessed or was handed the URL download it
+    without being signed in.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    path = _resume_pdf_path(request.user)
+    if not path.is_file():
+        return JsonResponse(
+            {'detail': 'No resume yet. Build one first.'}, status=404,
+        )
+
+    profile = getattr(request.user, 'candidate_profile', None)
+    return FileResponse(
+        path.open('rb'),
+        as_attachment=True,
+        filename=_resume_filename(profile) if profile else 'resume.pdf',
+        content_type='application/pdf',
     )
 
 
@@ -4574,6 +5064,10 @@ def verify_id_card(request):
 
 
 def _serialize_chat_session(instance, include_messages=False):
+    # ``message_count`` reads the ``Count('messages')`` annotation when the caller
+    # supplied one (list views do) and falls back to a query otherwise, so listing
+    # a page of sessions stays a fixed number of queries instead of one per row.
+    annotated = instance.__dict__.get('message_count')
     data = {
         'id': str(instance.pk),
         'title': instance.title,
@@ -4583,7 +5077,7 @@ def _serialize_chat_session(instance, include_messages=False):
             'id': instance.user_id,
             'name': instance.user.get_full_name() or instance.user.username,
         },
-        'message_count': instance.messages.count(),
+        'message_count': annotated if annotated is not None else instance.messages.count(),
     }
     if include_messages:
         data['messages'] = [
@@ -5659,6 +6153,13 @@ _COMMUNICATION_ANALYSIS_FIELDS = list(
     + _COMMUNICATION_FLOAT_FIELDS
     + _COMMUNICATION_TEXT_FIELDS
 )
+# Every analysis field that holds a number, i.e. all of the above minus the text
+# ones. Anything that averages across sessions must use this group: the text
+# fields hold the coach's prose, so they have no numeric meaning and cannot be
+# coerced with float().
+_COMMUNICATION_NUMERIC_FIELDS = list(
+    _COMMUNICATION_PERCENT_FIELDS + _COMMUNICATION_COUNT_FIELDS + _COMMUNICATION_FLOAT_FIELDS
+)
 
 
 COMMUNICATION_ANALYSIS_PROMPT = (
@@ -5802,9 +6303,30 @@ def communication_training_list(request):
     sessions = list(
         CommunicationTraining.objects
         .filter(user=request.user)
-        .order_by('-created_at')
+        .order_by('-created_at', '-pk')
     )
-    return JsonResponse({'sessions': [ _communication_training_payload(s) for s in sessions ]})
+    limit, offset = _history_page_bounds(request)
+    return JsonResponse(
+        _history_page_response(
+            sessions,
+            _communication_training_payload,
+            limit,
+            offset,
+            len(sessions),
+            # The history page's averages, best score and first-to-latest trend
+            # describe the whole record, so they are computed over every session
+            # instead of the page the reader happens to have loaded.
+            summary=_analyzed_history_summary(
+                sessions,
+                analyzed_when=lambda s: s.finalized_at is not None and (s.communication_score or 0) > 0,
+                score_of=lambda s: s.communication_score or 0,
+                # Numeric fields only. The text analysis fields hold prose, so
+                # averaging them would be meaningless as well as a type error.
+                extra_keys=_COMMUNICATION_NUMERIC_FIELDS,
+                skip_keys=('communication_score',),
+            ),
+        )
+    )
 
 
 @require_GET
@@ -6505,9 +7027,29 @@ def english_training_list(request):
     sessions = list(
         EnglishTrainingSession.objects
         .filter(user=request.user)
-        .order_by('-created_at')
+        .order_by('-created_at', '-pk')
     )
-    return JsonResponse({'sessions': [_english_session_payload(s) for s in sessions]})
+    limit, offset = _history_page_bounds(request)
+    return JsonResponse(
+        _history_page_response(
+            sessions,
+            _english_session_payload,
+            limit,
+            offset,
+            len(sessions),
+            # Same reasoning as the Communication history: the summary panel
+            # reports averages and a first-to-latest trend over every session, so
+            # those figures must not change as later pages load.
+            summary=_analyzed_history_summary(
+                sessions,
+                analyzed_when=lambda s: s.finalized_at is not None and (s.writing_score or 0) > 0,
+                score_of=lambda s: s.writing_score or 0,
+                extra_keys=_ENGLISH_ANALYSIS_FIELDS,
+                skip_keys=('writing_score',),
+                mistake_of=lambda s: len(s.mistakes or []),
+            ),
+        )
+    )
 
 
 @require_GET
@@ -7137,11 +7679,15 @@ def aplr_list(request):
 
     # Guard: any abandoned active chat is left as-is (the user may resume it).
     sessions = list(
-        APLRTraining.objects.filter(user=request.user).order_by('-created_at')
+        APLRTraining.objects.filter(user=request.user).order_by('-created_at', '-pk')
     )
-    return JsonResponse({
-        'sessions': [_aplr_session_payload(s) for s in sessions],
-    })
+    limit, offset = _history_page_bounds(request)
+    return JsonResponse(
+        _history_page_response(
+            sessions, _aplr_session_payload, limit, offset, len(sessions),
+            rollup=_practice_rollup(sessions),
+        )
+    )
 
 
 @require_POST
@@ -7760,11 +8306,15 @@ def basic_math_list(request):
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
 
     sessions = list(
-        BasicMathTraining.objects.filter(user=request.user).order_by('-created_at')
+        BasicMathTraining.objects.filter(user=request.user).order_by('-created_at', '-pk')
     )
-    return JsonResponse({
-        'sessions': [_bmath_session_payload(s) for s in sessions],
-    })
+    limit, offset = _history_page_bounds(request)
+    return JsonResponse(
+        _history_page_response(
+            sessions, _bmath_session_payload, limit, offset, len(sessions),
+            rollup=_practice_rollup(sessions),
+        )
+    )
 
 
 @require_POST
@@ -8362,11 +8912,17 @@ def situational_list(request):
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
 
     sessions = list(
-        SituationalProblemSolvingTraining.objects.filter(user=request.user).order_by('-created_at')
+        SituationalProblemSolvingTraining.objects
+        .filter(user=request.user)
+        .order_by('-created_at', '-pk')
     )
-    return JsonResponse({
-        'sessions': [_situational_session_payload(s) for s in sessions],
-    })
+    limit, offset = _history_page_bounds(request)
+    return JsonResponse(
+        _history_page_response(
+            sessions, _situational_session_payload, limit, offset, len(sessions),
+            rollup=_practice_rollup(sessions),
+        )
+    )
 
 
 @require_POST
@@ -9068,11 +9624,15 @@ def technical_list(request):
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
 
     sessions = list(
-        TechnicalTraining.objects.filter(user=request.user).order_by('-created_at')
+        TechnicalTraining.objects.filter(user=request.user).order_by('-created_at', '-pk')
     )
-    return JsonResponse({
-        'sessions': [_tech_session_payload(s) for s in sessions],
-    })
+    limit, offset = _history_page_bounds(request)
+    return JsonResponse(
+        _history_page_response(
+            sessions, _tech_session_payload, limit, offset, len(sessions),
+            rollup=_practice_rollup(sessions),
+        )
+    )
 
 
 @require_POST
@@ -9743,11 +10303,15 @@ def dsa_list(request):
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
 
     sessions = list(
-        DSATraining.objects.filter(user=request.user).order_by('-created_at')
+        DSATraining.objects.filter(user=request.user).order_by('-created_at', '-pk')
     )
-    return JsonResponse({
-        'sessions': [_dsa_session_payload(s) for s in sessions],
-    })
+    limit, offset = _history_page_bounds(request)
+    return JsonResponse(
+        _history_page_response(
+            sessions, _dsa_session_payload, limit, offset, len(sessions),
+            rollup=_practice_rollup(sessions),
+        )
+    )
 
 
 @require_POST
@@ -10191,6 +10755,13 @@ def _run_agentic_turn(contents, system_prompt, gen_config, user):
 # Chat session management
 # ---------------------------------------------------------------------------
 
+# Bounds for the paged chat-session list. The default is deliberately small: the
+# sidebar shows the newest handful and pulls the rest as the student scrolls, so
+# an old account never pays for its entire history on every page load.
+CHAT_SESSIONS_PAGE_DEFAULT = 20
+CHAT_SESSIONS_PAGE_MAX = 100
+
+
 @require_POST
 def chat_summarize(request):
     """End-of-session hook: generate a detailed summary of the user from the
@@ -10243,8 +10814,38 @@ def chat_sessions(request):
         session = ChatSession.objects.create(user=request.user, title=title)
         return JsonResponse({'session': _serialize_chat_session(session)}, status=201)
 
-    sessions = ChatSession.objects.filter(user=request.user).order_by('-updated_at')
-    return JsonResponse({'sessions': [_serialize_chat_session(s) for s in sessions]})
+    # The sidebar lists a student's chats, and a heavy user can have hundreds of
+    # them, so GET is paged: the client asks for ``limit`` rows starting at
+    # ``offset`` and keeps pulling until ``has_more`` goes false. ``-pk`` breaks
+    # ties on ``updated_at`` so rows that share a timestamp (very common once a
+    # bulk import lands) cannot shuffle between pages and repeat or skip.
+    try:
+        limit = int(request.GET.get('limit', CHAT_SESSIONS_PAGE_DEFAULT))
+    except (TypeError, ValueError):
+        limit = CHAT_SESSIONS_PAGE_DEFAULT
+    limit = max(1, min(limit, CHAT_SESSIONS_PAGE_MAX))
+
+    try:
+        offset = int(request.GET.get('offset', 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+
+    qs = (
+        ChatSession.objects.filter(user=request.user)
+        .annotate(message_count=Count('messages'))
+        .order_by('-updated_at', '-pk')
+    )
+    # Fetch one extra row instead of a COUNT: it answers "is there another page?"
+    # with the same single query that produced the page itself.
+    window = list(qs[offset:offset + limit + 1])
+    has_more = len(window) > limit
+    return JsonResponse({
+        'sessions': [_serialize_chat_session(s) for s in window[:limit]],
+        'has_more': has_more,
+        'offset': offset,
+        'limit': limit,
+    })
 
 
 @require_http_methods(['GET', 'DELETE'])
@@ -10999,6 +11600,18 @@ def _persist_onboarding(user, profile_data, messages):
         val = profile_data.get(field)
         if isinstance(val, list):
             setattr(profile, field, [str(i).strip() for i in val if str(i).strip()])
+
+    # A list comes straight from the tag input; a plain string (an older client or
+    # the chat onboarding) is split on the separators so it still reads as tags.
+    activities = profile_data.get('extracurricular_activities')
+    if isinstance(activities, list):
+        profile.extracurricular_activities = [
+            str(i).strip() for i in activities if str(i).strip()
+        ]
+    elif isinstance(activities, str):
+        profile.extracurricular_activities = [
+            part.strip() for part in re.split(r'[\n,]', activities) if part.strip()
+        ]
 
     email = str(profile_data.get('email') or '').strip().lower()
     if email and email != user.email:
@@ -11761,13 +12374,24 @@ MOCK_INTERVIEW_ANALYSIS_PROMPT = (
     '- "weaknesses": clear gaps or mistakes shown in the transcript, with specific evidence.\n'
     '- "opportunities": areas they can realistically turn into strengths or grow into.\n'
     '- "threats": risks that could hurt them in a real placement process.\n\n'
+    'Finally, every panel member who sat on this interview EXCEPT Atlas (the host and '
+    'integrity monitor) gets an improvement area of their own: ONE short sentence naming the single '
+    'thing that panelist most wants this candidate to work on, written from that panelist\'s point of '
+    'view and inside their own area of focus. Keep each one to a single sentence, make them specific '
+    'to what this transcript shows, and do not repeat the same improvement across panelists. Never '
+    'return an empty string for a panelist - if their area went well, name the next level they should '
+    'reach for instead.\n'
+    'Panel members to cover (exact ids in brackets):\n{panelists}\n\n'
     'Return ONLY JSON with this exact shape:\n'
     '{{"scores": {{{dimension_name}: {{"score": number, "evidence": string, '
     '"description": string}}, ...}}, '
-    ' "swot": {{"strengths": string, "weaknesses": string, "opportunities": string, "threats": string}}}}\n'
+    ' "swot": {{"strengths": string, "weaknesses": string, "opportunities": string, "threats": string}}, '
+    ' "improvements": {{"maya": string, "albert": string, "peter": string, "daniel": string, '
+    '"ada": string, "carl": string}}}}\n'
     '"scores" may contain fewer dimensions than the list above — omit the ones with no evidence, '
     'and key the rest by the exact dimension name (e.g. "Communication Skills"). The market has '
-    'dimension names as-is — do not rename them.'
+    'dimension names as-is — do not rename them. "improvements" must have one entry for EVERY '
+    'panelist id listed above and nothing else.'
 )
 
 
@@ -11783,6 +12407,37 @@ def _mock_transcript_text(interview):
         )
         lines.append(f'{speaker}: {msg.content}')
     return '\n'.join(lines)
+
+
+def _mock_analysis_panelists(interview):
+    """The reviewing panelists who sat on ``interview``, as ``(id, label)`` pairs.
+
+    Atlas is the permanent host and integrity monitor rather than a reviewer, so
+    he is never part of this - the panel that asks the questions is not the panel
+    that hands back an improvement area.
+    """
+    seated = interview.panelists or []
+    return [
+        (panelist_id, label)
+        for panelist_id, label in MOCK_INTERVIEW_ANALYSIS_PANELISTS
+        if panelist_id in seated
+    ]
+
+
+def _mock_improvement_line(text):
+    """Reduce an evaluator's improvement note to one single-line sentence.
+
+    Returns an empty string for anything empty, so a panelist the evaluator
+    skipped simply has no improvement area rather than a blank one.
+    """
+    line = ' '.join(str(text or '').split())
+    if not line:
+        return ''
+    sentence = re.split(r'(?<=[.!?])\s', line)[0].strip()
+    if len(sentence) > MOCK_IMPROVEMENT_MAX_CHARS:
+        sentence = sentence[:MOCK_IMPROVEMENT_MAX_CHARS].rsplit(' ', 1)[0]
+        sentence = sentence.rstrip(' ,;:-') + '...'
+    return sentence
 
 
 def _mock_analysis_payload(analysis):
@@ -11809,6 +12464,17 @@ def _mock_analysis_payload(analysis):
         'scored_dimensions': len(scored),
         'total_dimensions': len(MOCK_INTERVIEW_ANALYSIS_DIMENSIONS),
         'metrics': analysis.metrics,
+        # One improvement area per reviewing panelist, in panel order. Atlas is
+        # the host, not a reviewer, so he never appears here.
+        'improvements': [
+            {
+                'panelist': panelist_id,
+                'name': PANELIST_DISPLAY.get(panelist_id, panelist_id),
+                'remark': getattr(analysis, panelist_id, ''),
+            }
+            for panelist_id, _label in MOCK_INTERVIEW_ANALYSIS_PANELISTS
+            if getattr(analysis, panelist_id, '')
+        ],
         'swot': {
             'strengths': analysis.swot_strengths,
             'weaknesses': analysis.swot_weaknesses,
@@ -11869,6 +12535,9 @@ def _store_mock_analysis(interview, obj):
     swot = obj.get('swot') if isinstance(obj, dict) else {}
     if not isinstance(swot, dict):
         swot = {}
+    improvements = obj.get('improvements') if isinstance(obj, dict) else {}
+    if not isinstance(improvements, dict):
+        improvements = {}
     defaults = {
         'user': interview.user,
         'company_name': interview.company_name,
@@ -11878,6 +12547,12 @@ def _store_mock_analysis(interview, obj):
         'swot_opportunities': str(swot.get('opportunities') or '').strip(),
         'swot_threats': str(swot.get('threats') or '').strip(),
     }
+    # One improvement area per reviewing panelist, stored on that panelist's own
+    # field so it can be read, filtered and displayed per person.
+    for field, _label in _mock_analysis_panelists(interview):
+        line = _mock_improvement_line(improvements.get(field))
+        if line:
+            defaults[field] = line
     for field, (percentage, description) in metrics_by_field.items():
         defaults[field] = percentage
         defaults[f'{field}_desc'] = description
@@ -11915,6 +12590,10 @@ def _mock_analysis_generate(interview):
         f'{i + 1}. {name} â€” {definition}'
         for i, (_field, name, definition) in enumerate(MOCK_INTERVIEW_ANALYSIS_DIMENSIONS)
     )
+    panelists = '\n'.join(
+        f'- {label} [{panelist_id}]'
+        for panelist_id, label in _mock_analysis_panelists(interview)
+    ) or '- none'
     prompt = (
         company_context_block(company)
         + MOCK_INTERVIEW_ANALYSIS_PROMPT
@@ -11922,6 +12601,7 @@ def _mock_analysis_generate(interview):
         .replace('{questions}', focus)
         .replace('{profile}', profile_text)
         .replace('{dimensions}', dimensions)
+        .replace('{panelists}', panelists)
     )
     contents = [
         {
@@ -12531,6 +13211,11 @@ MOCK_TARGET_EXCHANGES = {
     'long': 22,
 }
 
+# Bounds for the paged "All interviews" list on the history screen. Only that
+# list is paged; the rollups beside it always describe the whole record.
+MOCK_INTERVIEW_PAGE_DEFAULT = 50
+MOCK_INTERVIEW_PAGE_MAX = 100
+
 # Average characters per English word including the trailing space. Answers are
 # only ever counted in SQL, so their length is summed in characters and
 # converted here rather than shipping every message body to the client.
@@ -12552,12 +13237,18 @@ def mock_interview_stats(request):
     per-interview score it reports is :func:`_mock_analysis_score` — the same
     moderated mean the readiness pillar already uses — run over stored
     percentages.
+
+    Only the ``interviews`` array is paged, via ``limit``/``offset``: that is the
+    long scrolling list at the bottom of the screen. ``totals``, ``tones`` and the
+    by-company/by-role rollups deliberately stay whole-record, because a
+    performance index that changed every time the candidate scrolled further down
+    would be worse than useless.
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
 
     interviews = list(
-        MockInterview.objects.filter(user=request.user).order_by('-created_at')
+        MockInterview.objects.filter(user=request.user).order_by('-created_at', '-pk')
     )
 
     def empty_payload():
@@ -12577,12 +13268,29 @@ def mock_interview_stats(request):
             },
             'tones': {'positive': 0, 'neutral': 0, 'negative': 0},
             'interviews': [],
+            'has_more': False,
+            'total': 0,
+            'offset': 0,
+            'limit': 0,
+            'scored': [],
             'by_company': [],
             'by_role': [],
         }
 
     if not interviews:
         return JsonResponse(empty_payload())
+
+    try:
+        limit = int(request.GET.get('limit', MOCK_INTERVIEW_PAGE_DEFAULT))
+    except (TypeError, ValueError):
+        limit = MOCK_INTERVIEW_PAGE_DEFAULT
+    limit = max(1, min(limit, MOCK_INTERVIEW_PAGE_MAX))
+    try:
+        offset = int(request.GET.get('offset', 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, min(offset, len(interviews)))
+    has_more = offset + limit < len(interviews)
 
     # One grouped pass over the message table. Counting the two roles in a
     # single .values().annotate() keeps this to two queries no matter how many
@@ -12646,8 +13354,19 @@ def mock_interview_stats(request):
     tones = {'positive': 0, 'neutral': 0, 'negative': 0}
     companies = set()
     roles = set()
+    # The score trend and the skills radar describe the candidate's whole record,
+    # so they cannot be derived from the paged `interviews` array without shifting
+    # every time the reader scrolls. Both are accumulated here over all interviews
+    # and sent whole; `scored` carries only the fields those two charts need.
+    scored_points = []
+    depth_values = []
 
-    for interview in interviews:
+    # The aggregate bookkeeping below runs over every interview, because the
+    # figures it produces describe the whole record. Only the rows inside the
+    # requested page are serialised, so a candidate with a hundred interviews
+    # sends ten of them over the wire instead of a hundred.
+    page_end = offset + limit
+    for position, interview in enumerate(interviews):
         turns = turn_rows.get(interview.pk) or {}
         user_turns = turns.get('user_turns') or 0
         assistant_turns = turns.get('assistant_turns') or 0
@@ -12655,20 +13374,21 @@ def mock_interview_stats(request):
         user_words = int(round(user_chars / MOCK_AVG_WORD_CHARS)) if user_chars else 0
         analysis = analysis_by_interview.get(interview.pk)
 
-        entry = _mock_interview_payload(
-            interview,
-            message_count=user_turns + assistant_turns,
-        )
-        entry['user_turns'] = user_turns
-        entry['assistant_turns'] = assistant_turns
-        entry['user_words'] = user_words
-        entry['target_exchanges'] = MOCK_TARGET_EXCHANGES.get(
-            interview.duration, MOCK_TARGET_EXCHANGES['standard']
-        )
-        # None whenever the interview was never scored, which is what the client
-        # needs in order to leave that cell empty instead of printing a zero.
-        entry['analysis'] = analysis
-        entries.append(entry)
+        if offset <= position < page_end:
+            entry = _mock_interview_payload(
+                interview,
+                message_count=user_turns + assistant_turns,
+            )
+            entry['user_turns'] = user_turns
+            entry['assistant_turns'] = assistant_turns
+            entry['user_words'] = user_words
+            entry['target_exchanges'] = MOCK_TARGET_EXCHANGES.get(
+                interview.duration, MOCK_TARGET_EXCHANGES['standard']
+            )
+            # None whenever the interview was never scored, which is what the client
+            # needs in order to leave that cell empty instead of printing a zero.
+            entry['analysis'] = analysis
+            entries.append(entry)
 
         if interview.status == MOCK_INTERVIEW_STATUS_COMPLETED:
             totals['completed'] += 1
@@ -12678,12 +13398,28 @@ def mock_interview_stats(request):
             totals['active'] += 1
         if analysis is not None:
             totals['scored'] += 1
+            scored_points.append({
+                'company_name': interview.company_name or '',
+                'created_at': interview.created_at.isoformat(),
+                'score': analysis['overall_score'],
+                'dimensions': analysis['dimensions'],
+            })
         totals['violations'] += interview.suspection or 0
         totals['user_turns'] += user_turns
         totals['assistant_turns'] += assistant_turns
         totals['user_words'] += user_words
         for tone in tones:
             tones[tone] += turns.get(f'{tone}_turns') or 0
+
+        # Answer depth is measured against each session's own exchange target, so
+        # a short interview is never judged against a long one. Only interviews
+        # that actually finished contribute; an abandoned one has no depth.
+        if interview.status != MOCK_INTERVIEW_STATUS_ACTIVE:
+            target = MOCK_TARGET_EXCHANGES.get(
+                interview.duration, MOCK_TARGET_EXCHANGES['standard']
+            )
+            if target:
+                depth_values.append(min(100, user_turns / target * 100))
 
         company = (interview.company_name or '').strip()
         if company:
@@ -12711,6 +13447,9 @@ def mock_interview_stats(request):
 
     totals['companies'] = len(companies)
     totals['roles'] = len(roles)
+    totals['avg_depth'] = round(sum(depth_values) / len(depth_values)) if depth_values else None
+    # Oldest-first, so the trend chart reads left to right.
+    scored_points.reverse()
 
     def finish_groups(rows):
         out = []
@@ -12730,6 +13469,11 @@ def mock_interview_stats(request):
         'totals': totals,
         'tones': tones,
         'interviews': entries,
+        'has_more': has_more,
+        'total': len(interviews),
+        'offset': offset,
+        'limit': limit,
+        'scored': scored_points,
         'by_company': finish_groups(company_rows),
         'by_role': finish_groups(role_rows),
     })
@@ -13145,12 +13889,38 @@ def notifications(request):
     _fill_due_nudges(request.user)
     audience = _notification_audience(request.user)
     receipts = _notification_read_map(request.user)
-    items = [
-        _notification_payload(n, receipts.get(n.pk))
-        for n in audience
-    ]
     unread = sum(1 for n in audience if not (receipts.get(n.pk) and receipts[n.pk].read))
-    return JsonResponse({'notifications': items, 'unread': unread})
+
+    # The inbox's two filters run here, before paging, so a 50-row window stays
+    # coherent: filtering 50 rows client-side would hide matching rows that live
+    # on a later page. Pinned-then-newest ordering keeps every pin on the first
+    # page and gives page 2 a stable, non-overlapping window.
+    sender_filter = request.GET.get('sender')
+    if sender_filter:
+        sender_key = {
+            'Placement Cell': NOTIFICATION_SENDER_PLACEMENT_CELL,
+            'TalentBro Platform': NOTIFICATION_SENDER_PLATFORM,
+        }.get(sender_filter, sender_filter)
+        if sender_key in (NOTIFICATION_SENDER_PLACEMENT_CELL, NOTIFICATION_SENDER_PLATFORM):
+            audience = audience.filter(sender=sender_key)
+    if request.GET.get('unread') in ('1', 'true', 'True'):
+        audience = audience.exclude(
+            pk__in=[nid for nid, receipt in receipts.items() if receipt.read]
+        )
+
+    ordered = audience.order_by('-pinned', '-created_at')
+    total = ordered.count()
+    limit, offset = _history_page_bounds(request)
+    page = list(ordered[offset:offset + limit])
+    items = [_notification_payload(n, receipts.get(n.pk)) for n in page]
+    return JsonResponse({
+        'notifications': items,
+        'unread': unread,
+        'total': total,
+        'has_more': offset + len(page) < total,
+        'offset': offset,
+        'limit': limit,
+    })
 
 
 @require_POST
@@ -13400,24 +14170,13 @@ def _client_institution(user):
 
 
 def _sum_drive_vacancies(rows):
-    """Total openings across an iterable of (total_vacancies, roles) drive rows.
+    """Total openings across an iterable of total_vacancies drive rows.
 
-    Mirrors Drive.vacancies per drive: the stored total_vacancies when set,
-    otherwise the sum of the per-role vacancy counts in Drive.roles. A single
-    source of truth so the companies, drives, dashboard, reports and the
-    total-vacancies endpoint all count the same openings.
+    Mirrors Drive.vacancies per drive. A single source of truth so the companies,
+    drives, dashboard, reports and the total-vacancies endpoint all count the
+    same openings. Unset (None) counts as zero.
     """
-    total = 0
-    for stored, roles in rows:
-        if stored is not None:
-            total += stored
-        else:
-            total += sum(
-                int(role.get('vacancies') or 0)
-                for role in (roles or [])
-                if isinstance(role, dict)
-            )
-    return total
+    return sum(int(stored or 0) for stored in rows)
 
 
 def _institution_openings(institution):
@@ -13427,7 +14186,7 @@ def _institution_openings(institution):
     return _sum_drive_vacancies(
         Drive.objects
         .filter(institution=institution)
-        .values_list('total_vacancies', 'roles')
+        .values_list('total_vacancies', flat=True)
     )
 
 
@@ -13441,11 +14200,11 @@ def _drive_totals_by_company(companies):
     rows = (
         Drive.objects
         .filter(company__in=companies)
-        .values_list('company_id', 'total_vacancies', 'roles')
+        .values_list('company_id', 'total_vacancies')
     )
-    for company_pk, stored, roles in rows:
+    for company_pk, stored in rows:
         bucket = totals.setdefault(company_pk, {'openings': 0, 'count': 0})
-        bucket['openings'] += _sum_drive_vacancies([(stored, roles)])
+        bucket['openings'] += int(stored or 0)
         bucket['count'] += 1
     return totals
 
@@ -13469,32 +14228,19 @@ def _company_payload(company, drive_totals=None):
         'company_name': company.company_name,
         'industry': company.industry,
         'company_description': company.company_description,
-        'job_roles': company.job_roles or [],
+        # Always the fixed four-key shape (see Company.ai_info_blocks); empty
+        # list until Gemini has written the first block.
+        'company_ai_info': company.ai_info_blocks,
         'eligible_courses': company.eligible_courses or [],
         'eligible_branches': company.eligible_branches or [],
         'minimum_cgpa': float(company.minimum_cgpa) if company.minimum_cgpa is not None else None,
         'maximum_backlogs': company.maximum_backlogs,
         'graduation_year': company.graduation_year,
-        'required_skills': company.required_skills or [],
-        'preferred_skills': company.preferred_skills or [],
         'salary_min': float(company.salary_min) if company.salary_min is not None else None,
         'salary_max': float(company.salary_max) if company.salary_max is not None else None,
         'work_location': company.work_location,
-        'work_mode': company.work_mode,
         'openings': openings,
         'drive_count': drive_count,
-        'selection_rounds': company.selection_rounds or [],
-        'application_deadline': (
-            company.application_deadline.isoformat()
-            if company.application_deadline else None
-        ),
-        'campus_visit_date': (
-            company.campus_visit_date.isoformat()
-            if company.campus_visit_date else None
-        ),
-        'recruitment_status': company.recruitment_status,
-        'placement_mode': company.placement_mode,
-        'offer_status': company.offer_status,
         'tier': company.tier,
         'institution': company.institution.name if company.institution_id else None,
         'created_at': company.created_at.isoformat(),
@@ -13579,27 +14325,102 @@ def company_create(request):
         company_id=str(data.get('company_id', '')).strip(),
         industry=str(data.get('industry', '')).strip(),
         company_description=str(data.get('company_description', '')).strip(),
-        job_roles=_as_str_list(data.get('job_roles')),
         eligible_courses=_as_str_list(data.get('eligible_courses')),
         eligible_branches=_as_str_list(data.get('eligible_branches')),
         minimum_cgpa=data.get('minimum_cgpa') if data.get('minimum_cgpa') not in (None, '') else None,
         maximum_backlogs=_as_int(data.get('maximum_backlogs')),
         graduation_year=_as_int(data.get('graduation_year')),
-        required_skills=_as_str_list(data.get('required_skills')),
-        preferred_skills=_as_str_list(data.get('preferred_skills')),
         salary_min=data.get('salary_min') if data.get('salary_min') not in (None, '') else None,
         salary_max=data.get('salary_max') if data.get('salary_max') not in (None, '') else None,
         work_location=str(data.get('work_location', '')).strip(),
-        work_mode=str(data.get('work_mode') or 'onsite'),
-        selection_rounds=_as_str_list(data.get('selection_rounds')),
-        recruitment_status=str(data.get('recruitment_status') or 'upcoming'),
-        placement_mode=str(data.get('placement_mode') or 'full_time'),
-        offer_status=str(data.get('offer_status') or 'pending'),
         tier=str(data.get('tier') or 'core'),
         institution=institution,
         client=client,
     )
+    # The company row is committed before this call, so the profile it writes in
+    # the background is a follow-up update on an existing row, never part of the
+    # registration the staff member is waiting on.
+    _generate_company_ai_info(company, user=request.user)
     return JsonResponse({'company': _company_payload(company, {})}, status=201)
+
+
+@require_http_methods(['PATCH', 'PUT'])
+def company_update(request, company_id):
+    """Edit a company recorded for the signed-in staff's institution.
+
+    PATCH /api/companies/<id>/update/  ->  {"company": {...}}
+
+    The company is looked up inside the caller's own institution, so one
+    college can never edit another's partner. Only the keys present in the body
+    are written, which keeps the endpoint usable for both full-form saves and
+    single-field corrections. The AI profile is never hand-edited here: it keeps
+    whatever Gemini last wrote, and the identity fields (company_id, client,
+    institution) stay put.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'Only institution staff can edit companies.'}, status=403,
+        )
+
+    company = Company.objects.filter(pk=company_id, institution=institution).first()
+    if company is None:
+        return JsonResponse({'detail': 'Company not found.'}, status=404)
+
+    try:
+        data = json.loads(request.body or '{}')
+    except ValueError:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+    if not isinstance(data, dict):
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    if 'company_name' in data:
+        company_name = str(data.get('company_name') or '').strip()
+        if not company_name:
+            return JsonResponse({'detail': 'Company name is required.'}, status=400)
+        company.company_name = company_name
+
+    for field in ('industry', 'company_description', 'work_location'):
+        if field in data:
+            setattr(company, field, str(data.get(field) or '').strip())
+
+    if 'tier' in data:
+        tier = str(data.get('tier') or '').strip()
+        if tier not in dict(COMPANY_TIER_CHOICES):
+            return JsonResponse({'detail': 'Unknown hiring tier.'}, status=400)
+        company.tier = tier
+
+    def _as_int(value):
+        if value is None or value == '':
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _as_str_list(value):
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str) and value.strip():
+            return [v.strip() for v in value.split(',') if v.strip()]
+        return []
+
+    for field in ('minimum_cgpa', 'salary_min', 'salary_max'):
+        if field in data:
+            value = data.get(field)
+            setattr(company, field, value if value not in (None, '') else None)
+    for field in ('maximum_backlogs', 'graduation_year'):
+        if field in data:
+            setattr(company, field, _as_int(data.get(field)))
+    for field in ('eligible_courses', 'eligible_branches'):
+        if field in data:
+            setattr(company, field, _as_str_list(data.get(field)))
+
+    company.save()
+    return JsonResponse({'company': _company_payload(company, _drive_totals_by_company([company]))})
 
 
 @require_GET
@@ -13628,6 +14449,106 @@ def candidate_companies(request):
         .order_by('company_name')
     )
     return JsonResponse({'companies': companies})
+
+
+def _candidate_drive_payload(drive):
+    """Serialize a Drive for the student-facing Company/Drives screen.
+
+    The same hiring detail the staff drive card shows, minus the internal
+    eligible-student head count: that number describes the placement cell's
+    queue, not this student's own standing, so it is never sent to a candidate.
+    """
+    payload = _drive_payload(drive, 0, drive.vacancies)
+    payload.pop('eligible_count', None)
+    return payload
+
+
+@require_GET
+def candidate_company_drives(request):
+    """Companies and drives recorded for the signed-in candidate's college.
+
+    GET /api/candidate/company-drives/  ->
+        {"companies": [...], "drives": [...], "count": N, "drive_count": M}
+
+    The student mirror of the staff /companies and /drives listings, scoped to
+    the candidate's own Institution. Every registered company is returned even
+    before it has hired; drives are the hiring events the placement cell has
+    scheduled. Staff-only figures (the eligible-candidate head count) are
+    deliberately omitted - see _candidate_drive_payload.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    profile = getattr(request.user, 'candidate_profile', None)
+    institution = profile.college if (profile and profile.college_id) else None
+    if institution is None:
+        return JsonResponse({
+            'companies': [], 'drives': [], 'count': 0, 'drive_count': 0,
+        })
+
+    companies_qs = (
+        Company.objects
+        .filter(institution=institution)
+        .order_by('-salary_max', 'company_name')
+    )
+    drive_totals = _drive_totals_by_company(companies_qs)
+    companies = [_company_payload(c, drive_totals) for c in companies_qs]
+
+    drives_qs = (
+        Drive.objects
+        .filter(institution=institution)
+        .select_related('company')
+        .order_by('-visit_date', '-created_at')
+    )
+    drives = [_candidate_drive_payload(drive) for drive in drives_qs]
+
+    return JsonResponse({
+        'companies': companies,
+        'drives': drives,
+        'count': len(companies),
+        'drive_count': len(drives),
+    })
+
+
+@require_GET
+def candidate_company_drive_detail(request, company_id):
+    """One company from the candidate's college, with the drives it has run.
+
+    GET /api/candidate/company-drives/<company_id>/  ->  {"company": {...}, "drives": [...]}
+
+    Read-only: the Gemini profile is whatever is already stored on the row. A
+    company with no block simply has no "about" copy - the student page hides
+    that section rather than inventing one, so reading this never spends an AI
+    call.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    profile = getattr(request.user, 'candidate_profile', None)
+    institution = profile.college if (profile and profile.college_id) else None
+    if institution is None:
+        return JsonResponse({'detail': 'No college linked to this account.'}, status=404)
+
+    try:
+        company = Company.objects.get(pk=company_id, institution=institution)
+    except Company.DoesNotExist:
+        # Scoped to the candidate's own institution, so another college's
+        # recruiter is simply not found rather than a permission error.
+        return JsonResponse({'detail': 'Company not found.'}, status=404)
+
+    drives = [
+        _candidate_drive_payload(drive)
+        for drive in Drive.objects
+        .filter(institution=institution, company=company)
+        .select_related('company')
+        .order_by('-visit_date', '-created_at')
+    ]
+    return JsonResponse({
+        'company': _company_payload(
+            company, _drive_totals_by_company(Company.objects.filter(pk=company.pk)),
+        ),
+        'drives': drives,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -13686,6 +14607,10 @@ def _candidate_payload(c, readiness=None, ranks=None):
         'middle_name': c.middle_name,
         'last_name': c.last_name,
         'full_name': c.full_name,
+        # The professional headline, shown publicly to everyone who can see the
+        # student (leaderboard, student detail, staff directory). It is
+        # candidate-editable, so the client treats it as free text.
+        'bio': c.bio or '',
         'department': c.department,
         'program': c.program,
         'start_year': c.start_year,
@@ -13694,16 +14619,20 @@ def _candidate_payload(c, readiness=None, ranks=None):
         'gender': c.gender,
         'cgpa': float(c.cgpa) if c.cgpa is not None else None,
         'placement_status': c.placement_status,
-        # Resolved, not raw: the key stays a plain boolean so every consumer of
-        # the student payload agrees with the dashboard and reports, while the
-        # untouched override is exposed separately for the admin/UI to show.
+        # Resolved, not raw: this is the one place the readiness rule is
+        # applied, so the student payload, the dashboard, the reports and the
+        # drive pools can never print two different answers for one student.
         'placement_eligible': _effective_eligible(c),
-        'placement_eligible_override': c.placement_eligible,
         'skills': c.skills or [],
         'preferred_roles': c.preferred_roles or [],
         'preferred_locations': c.preferred_locations or [],
+        # Clubs, competitions, events and volunteering the student took part in.
+        'extracurricular_activities': c.extracurricular_activities or [],
         'expected_ctc': float(c.expected_ctc) if c.expected_ctc is not None else None,
         'time_spent': int(c.time_spent),
+        # Total Gemini spend burnt by this candidate, in INR and already carrying
+        # the 40% margin (see CandidateProfile.cost_incurred). Staff-facing only.
+        'cost_incurred': float(c.cost_incurred or 0),
         'id_verified': c.id_verified,
         'account_status': c.account_status,
         'created_at': c.created_at.isoformat(),
@@ -13716,68 +14645,101 @@ def _candidate_payload(c, readiness=None, ranks=None):
     }
 
 
-def _drive_payload(company, eligible_count, openings=0):
-    """Serialize a Company row as a placement drive card for the client UI."""
-    if company.recruitment_status == 'ongoing':
+def _drive_payload(drive, eligible_count, openings=0):
+    """Serialize a Drive row as a placement drive card for the client UI.
+
+    Everything shown here is a property of this one hiring event and is read off
+    the Drive. The company behind it only supplies identity and tier; a company
+    with several drives appears once per drive with its own dates, rounds and
+    status each time.
+    """
+    company = drive.company
+    if drive.status == 'ongoing':
         status = 'Live'
-    elif company.recruitment_status == 'upcoming':
+    elif drive.status == 'upcoming':
         status = 'Upcoming'
-    elif company.recruitment_status == 'completed':
+    elif drive.status == 'completed':
         status = 'Completed'
     else:
         status = 'Cancelled'
+    # One role per drive, so the card carries a single name.
+    role = drive.role or ''
     return {
+        'drive_id': drive.pk,
         'company_id': company.company_id,
         'company_name': company.company_name,
+        'title': drive.title,
         'industry': company.industry,
-        'roles': company.job_roles or [],
-        'ctc_min': float(company.salary_min) if company.salary_min is not None else None,
-        'ctc_max': float(company.salary_max) if company.salary_max is not None else None,
+        'role': role,
+        'ctc_min': float(drive.salary_min) if drive.salary_min is not None else (
+            float(company.salary_min) if company.salary_min is not None else None
+        ),
+        'ctc_max': float(drive.salary_max) if drive.salary_max is not None else (
+            float(company.salary_max) if company.salary_max is not None else None
+        ),
         'tier': company.tier,
-        'mode': company.work_mode,
-        'location': company.work_location,
+        'mode': drive.work_mode,
+        'location': drive.work_location or company.work_location,
         'application_deadline': (
-            company.application_deadline.isoformat()
-            if company.application_deadline else None
+            drive.application_deadline.isoformat()
+            if drive.application_deadline else None
         ),
         'campus_visit_date': (
-            company.campus_visit_date.isoformat()
-            if company.campus_visit_date else None
+            drive.visit_date.isoformat() if drive.visit_date else None
         ),
         'status': status,
         'openings': openings,
-        'eligible_courses': company.eligible_courses or [],
-        'eligible_branches': company.eligible_branches or [],
-        'minimum_cgpa': float(company.minimum_cgpa) if company.minimum_cgpa is not None else None,
-        'maximum_backlogs': company.maximum_backlogs,
-        'required_skills': company.required_skills or [],
-        'selection_rounds': company.selection_rounds or [],
-        'placement_mode': company.placement_mode,
-        'offer_status': company.offer_status,
+        'eligible_courses': drive.eligible_courses or company.eligible_courses or [],
+        'eligible_branches': drive.eligible_branches or company.eligible_branches or [],
+        'minimum_cgpa': float(drive.minimum_cgpa) if drive.minimum_cgpa is not None else (
+            float(company.minimum_cgpa) if company.minimum_cgpa is not None else None
+        ),
+        'maximum_backlogs': (
+            drive.maximum_backlogs
+            if drive.maximum_backlogs is not None else company.maximum_backlogs
+        ),
+        'required_skills': drive.required_skills or [],
+        'preferred_skills': drive.preferred_skills or [],
+        'selection_rounds': drive.selection_rounds or [],
+        'placement_mode': drive.placement_mode,
+        'offer_status': drive.offer_status,
         'eligible_count': eligible_count,
+        # Sent only so the edit form can be prefilled from the same payload the
+        # card is drawn from, instead of guessing at values it cannot see.
+        'drive_mode': drive.drive_mode,
+        'graduation_year': drive.graduation_year,
+        'total_vacancies': drive.total_vacancies,
     }
 
 
-def _eligible_student_count(institution, company):
+def _eligible_student_count(institution, drive):
     """How many candidates of this institution genuinely qualify for a drive.
 
-    This is the "front of the queue" number â€” students who are eligible, not
-    yet placed and meet the company's CGPA / branch / course bar.
+    This is the "front of the queue" number - students who are eligible, not
+    yet placed and meet the CGPA / branch / course bar.
+
+    The bar is resolved with the same precedence the drive card shows: whatever
+    this drive declares wins, and the company behind it is only the fallback.
+    Otherwise a drive that narrows the bar would display one set of criteria
+    while reporting a head count measured against a different one.
     """
-    queryset = _with_effective_eligibility(
+    company = drive.company
+    minimum_cgpa = (
+        drive.minimum_cgpa if drive.minimum_cgpa is not None else company.minimum_cgpa
+    )
+    branches = drive.eligible_branches or company.eligible_branches
+    courses = drive.eligible_courses or company.eligible_courses
+    queryset = _eligible_candidates(
         CandidateProfile.objects.filter(
             college=institution,
-            cgpa__isnull=False,
             account_status='active',
         ).exclude(placement_status='placed')
-    ).filter(effective_eligible=True)
-    if company.minimum_cgpa is not None:
-        queryset = queryset.filter(cgpa__gte=company.minimum_cgpa)
+    )
+    if minimum_cgpa is not None:
+        queryset = queryset.filter(cgpa__gte=minimum_cgpa)
     matches = []
     for c in queryset.only('candidate_id', 'department', 'program', 'cgpa'):
-        if _branch_matches(c.department, company.eligible_branches) and _course_matches(
-            c.program, company.eligible_courses
-        ):
+        if _branch_matches(c.department, branches) and _course_matches(c.program, courses):
             matches.append(c.candidate_id)
     return len(matches)
 
@@ -13801,7 +14763,7 @@ def _monthly_students(institution, months=8):
 def _department_stats(institution):
     stats = {}
     for c in CandidateProfile.objects.filter(college=institution).only(
-        'department', 'cgpa', 'placement_status', 'placement_eligible',
+        'department', 'cgpa', 'placement_status',
         'readiness_score', 'expected_ctc',
     ):
         dept = c.department or 'Unassigned'
@@ -13812,7 +14774,7 @@ def _department_stats(institution):
             'cgpa_sum': 0.0, 'cgpa_count': 0, 'ctc_sum': 0.0, 'ctc_count': 0,
         })
         row['total'] += 1
-        if _effective_eligible(c) and c.cgpa is not None:
+        if _effective_eligible(c):
             row['eligible'] += 1
         if c.placement_status == 'placed':
             row['placed'] += 1
@@ -13833,6 +14795,177 @@ def _department_stats(institution):
     return sorted(rows, key=lambda r: -r['total'])
 
 
+def _placement_member_payload(profile):
+    """One row of the placement-cell roster.
+
+    Deliberately omits anything sensitive: this list is visible to every member
+    of the office, not just the owner, and an invite flow has no business
+    handing out who has admin rights.
+    """
+    return {
+        'id': profile.pk,
+        'user_id': profile.user_id,
+        'full_name': profile.full_name,
+        'official_email': profile.official_email,
+        'mobile_number': profile.mobile_number,
+        'designation': profile.designation,
+        'employee_staff_id': profile.employee_staff_id,
+        'avatar': profile.avatar,
+        'access': profile.access,
+        'is_master': profile.is_master,
+        'created_at': profile.created_at.isoformat() if profile.created_at else None,
+    }
+
+
+@require_GET
+def placement_cell_members(request):
+    """The staff roster of the signed-in staff member's placement cell.
+
+    GET /api/placement-cell/members/  ->  {members, count, can_add_members}
+
+    Every member of the office may read the roster, so colleagues can see who
+    else they work with. `can_add_members` tells the client whether this account
+    is a Master owner, and is the single thing the UI gates the "Add member"
+    button on.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
+
+    requester = ClientProfile.objects.filter(user_id=request.user.pk).first()
+    members = [
+        _placement_member_payload(profile)
+        for profile in ClientProfile.objects
+        .filter(institution=institution)
+        .select_related('user')
+        .order_by('full_name')
+    ]
+    return JsonResponse({
+        'members': members,
+        'count': len(members),
+        'can_add_members': requester is not None and requester.is_master,
+    })
+
+
+@require_POST
+def placement_cell_member_create(request):
+    """Add a colleague to the placement department as another ClientProfile.
+
+    POST /api/placement-cell/members/
+        {full_name, official_email, designation?, mobile_number?,
+         employee_staff_id?, access?}
+        ->  {member, temporary_password}
+
+    Only a Master-access account can do this. A Beta member is read-only by
+    design, so handing out new accounts is a Master-only action, and the new
+    member is always attached to the *requester's own* institution - never to an
+    institution named in the request body, so one college cannot staff another.
+
+    The account is created with a generated temporary password, returned once in
+    this response and never stored in plaintext. There is no password-reset flow
+    in this app, so the owner shares it out of band and the member changes it
+    via /api/auth/change-password/ after signing in.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
+
+    requester = ClientProfile.objects.filter(user_id=request.user.pk).first()
+    if requester is None:
+        return JsonResponse({'detail': 'No client profile for this account.'}, status=403)
+    if not requester.is_master:
+        return JsonResponse(
+            {'detail': 'Only a Master account can add members to the placement cell.'},
+            status=403,
+        )
+
+    data = _json_body(request)
+    if data is None:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    full_name = str(data.get('full_name') or '').strip()
+    official_email = str(data.get('official_email') or '').strip().lower()
+    designation = str(data.get('designation') or '').strip()
+    mobile_number = str(data.get('mobile_number') or '').strip()
+    employee_staff_id = str(data.get('employee_staff_id') or '').strip()
+
+    missing = [
+        label for label, value in (
+            ('full_name', full_name), ('official_email', official_email),
+            ('designation', designation), ('mobile_number', mobile_number),
+        ) if not value
+    ]
+    if missing:
+        return JsonResponse({
+            'detail': 'Please fill in all required fields.',
+            'missing_fields': missing,
+        }, status=400)
+
+    try:
+        validate_email(official_email)
+    except ValidationError:
+        return JsonResponse({'detail': 'Enter a valid email address.'}, status=400)
+
+    # ClientProfile.mobile_number carries this validator, but Model.create()
+    # never runs full_clean(), so it has to be enforced here or a malformed
+    # number lands in the database unchecked.
+    try:
+        MOBILE_NUMBER_VALIDATOR(mobile_number)
+    except ValidationError as exc:
+        return JsonResponse({'detail': ' '.join(exc.messages)}, status=400)
+
+    # The email is the username across this project (see signup), so a repeat
+    # invite lands on the same account instead of forking a second person.
+    existing = User.objects.filter(username__iexact=official_email).first()
+    if existing is not None:
+        if ClientProfile.objects.filter(user=existing).exists():
+            return JsonResponse(
+                {'detail': 'An account with this email already exists.'}, status=400,
+            )
+        return JsonResponse({
+            'detail': 'This email is already registered as a Candidate. They cannot be '
+                      'added to the placement cell.',
+        }, status=400)
+
+    # New members start read-only. An owner can promote someone to Master later;
+    # handing out full access by default would make one mistaken invite a
+    # privilege-escalation bug.
+    access = str(data.get('access') or '').strip()
+    if access not in dict(ClientProfile.ACCESS_CHOICES):
+        access = ClientProfile.ACCESS_BETA
+
+    with transaction.atomic():
+        user = User.objects.create(
+            username=official_email, email=official_email, first_name=full_name,
+        )
+        temporary_password = get_random_string(12)
+        user.set_password(temporary_password)
+        user.save()
+
+        member = ClientProfile.objects.create(
+            user=user,
+            institution=institution,
+            full_name=full_name,
+            official_email=official_email,
+            mobile_number=mobile_number,
+            designation=designation,
+            employee_staff_id=employee_staff_id,
+            access=access,
+        )
+
+    return JsonResponse({
+        'member': _placement_member_payload(member),
+        # Shown once, to the owner, immediately after they add the member.
+        'temporary_password': temporary_password,
+    }, status=201)
+
+
 @require_GET
 def institution_overview(request):
     """Overview data for the client dashboard: institution, client, KPIs and trends.
@@ -13849,9 +14982,7 @@ def institution_overview(request):
     candidates = CandidateProfile.objects.filter(college=institution)
     companies = Company.objects.filter(institution=institution)
 
-    eligible_qs = _with_effective_eligibility(candidates).filter(
-        effective_eligible=True, cgpa__isnull=False,
-    )
+    eligible_qs = _eligible_candidates(candidates)
     placed_qs = candidates.filter(placement_status='placed')
     cgpa_float = [float(c) for c in candidates.exclude(cgpa__isnull=True).values_list('cgpa', flat=True)]
     ctc_float = [float(c) for c in candidates.exclude(expected_ctc__isnull=True).values_list('expected_ctc', flat=True)]
@@ -13861,7 +14992,9 @@ def institution_overview(request):
     placed = placed_qs.count()
     applied = candidates.filter(placement_status__in=ACTIVE_PLACEMENT_STATUSES).count()
     shortlisted = candidates.filter(placement_status='shortlisted').count()
-    active_drives = companies.filter(recruitment_status__in=['upcoming', 'ongoing']).count()
+    active_drives = Drive.objects.filter(
+        institution=institution, status__in=['upcoming', 'ongoing'],
+    ).count()
     verified = candidates.filter(id_verified=True).count()
 
     kpis = {
@@ -13927,9 +15060,10 @@ def institution_overview(request):
             'placement_office_email': institution.placement_office_email,
             'approximate_student_strength': institution.approximate_student_strength,
             'courses_offered': institution.courses_offered or [],
-            'departments': [
-                d.strip() for d in (institution.departments or '').split(',') if d.strip()
-            ],
+            # Institution.departments is stored as a JSON array string
+            # ('["Computer Science", "IT"]'), so a plain split(',') hands the
+            # caller fragments like '["Computer Science"'. Parse it properly.
+            'departments': _institution_department_list(institution),
         },
         'client': client_payload,
         'kpis': kpis,
@@ -13968,12 +15102,16 @@ def students_list(request):
 
     q = str(request.GET.get('q') or '').strip().lower()
     if q:
+        # Candidate IDs are stored as dashless 32-char hex, so the dashed form
+        # the directory displays is stripped before matching on them.
+        id_term = q.replace('-', '')
         queryset = queryset.filter(
             Q(first_name__icontains=q)
             | Q(middle_name__icontains=q)
             | Q(last_name__icontains=q)
             | Q(department__icontains=q)
             | Q(program__icontains=q)
+            | Q(candidate_id__icontains=id_term)
         )
     dept = str(request.GET.get('dept') or '').strip()
     if dept and dept != 'All':
@@ -13990,9 +15128,7 @@ def students_list(request):
     if min_cgpa > 0:
         queryset = queryset.filter(cgpa__isnull=False, cgpa__gte=min_cgpa)
     if request.GET.get('eligible') == '1':
-        queryset = _with_effective_eligibility(queryset).filter(
-            effective_eligible=True, cgpa__isnull=False,
-        )
+        queryset = _eligible_candidates(queryset)
 
     sort = str(request.GET.get('sort') or 'cgpa')
     ordering = {
@@ -14041,6 +15177,208 @@ def students_list(request):
         # The institution's own approximate student strength, which is broader
         # still: it covers students who have no candidate profile in the system.
         'approximate_student_strength': institution.approximate_student_strength,
+    })
+
+
+# Adding students in bulk from the directory. The placement cell supplies email
+# addresses and nothing else, so these are deliberately bare profile rows: no
+# invented name, CGPA, department or readiness. The student fills those in, and
+# the readiness bar treats a null score as "nothing to judge them on" rather
+# than disqualifying them.
+STUDENT_EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]{2,}$')
+# A guard against a pasted spreadsheet the size of a whole college going through
+# in one request. Well above any real batch a placement cell types by hand.
+MAX_STUDENTS_PER_REQUEST = 500
+
+
+def _requested_student_emails(data):
+    """Pull the wanted addresses out of an add/check request body.
+
+    Returns ``(wanted, invalid)``: wanted is normalised to lower case and
+    de-duplicated while keeping the order it was sent in, so one address pasted
+    three different ways is only ever one student. ``None`` for wanted means the
+    body did not carry a list at all.
+    """
+    raw_emails = data.get('emails')
+    if isinstance(raw_emails, str):
+        raw_emails = [part for part in re.split(r'[\s,;]+', raw_emails) if part]
+    if not isinstance(raw_emails, list):
+        return None, None
+    wanted, invalid, seen = [], [], set()
+    for value in raw_emails:
+        email = str(value or '').replace('\uFEFF', '').strip().strip('"\'(),;').lower()
+        if not email:
+            continue
+        if not STUDENT_EMAIL_RE.match(email):
+            invalid.append(email)
+            continue
+        if email in seen:
+            continue
+        seen.add(email)
+        wanted.append(email)
+    return wanted, invalid
+
+
+def _profiles_for_emails(emails):
+    """CandidateProfile rows whose account or personal email is one of these.
+
+    Matches on the account (the email is the username across this project) and
+    on the profile's own personal_email, so an address recorded either way is
+    found. An exact pass first — it is indexed — and an iexact pass only over
+    the addresses that missed, so older rows stored with different casing are
+    still caught without running a thousand-case scan on every keystroke.
+    """
+    found = {}
+    for profile in CandidateProfile.objects.filter(
+        Q(user__username__in=emails) | Q(user__email__in=emails) | Q(personal_email__in=emails)
+    ).select_related('user', 'college'):
+        for address in (profile.personal_email, profile.user and profile.user.email,
+                        profile.user and profile.user.username):
+            if address:
+                found.setdefault(address.strip().lower(), profile)
+    missing = [e for e in emails if e not in found]
+    if missing:
+        clause = Q()
+        for email in missing:
+            clause |= Q(user__username__iexact=email) | Q(user__email__iexact=email) | Q(
+                personal_email__iexact=email,
+            )
+        for profile in CandidateProfile.objects.filter(clause).select_related('user', 'college'):
+            for address in (profile.personal_email, profile.user and profile.user.email,
+                            profile.user and profile.user.username):
+                if address:
+                    found.setdefault(address.strip().lower(), profile)
+    return found
+
+
+@require_POST
+def students_check(request):
+    """Report which of these addresses already have a candidate profile.
+
+    POST /api/students/check/  {"emails": ["a@college.edu", ...]}
+        ->  {existing: [{email, college, website, same_college}], available}
+    Lets the directory warn about a clash before anything is written, instead of
+    silently skipping it on save.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'Only institution staff can add students.'}, status=403,
+        )
+
+    try:
+        data = json.loads(request.body or '{}')
+    except ValueError:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+    if not isinstance(data, dict):
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    wanted, _invalid = _requested_student_emails(data)
+    if wanted is None:
+        return JsonResponse({'detail': 'Send a list of emails as "emails".'}, status=400)
+    if not wanted:
+        return JsonResponse({'existing': [], 'available': 0})
+    if len(wanted) > MAX_STUDENTS_PER_REQUEST:
+        return JsonResponse(
+            {'detail': f'Check at most {MAX_STUDENTS_PER_REQUEST} students at a time.'},
+            status=400,
+        )
+
+    profiles = _profiles_for_emails(wanted)
+    existing = []
+    for email in wanted:
+        profile = profiles.get(email)
+        if profile is None:
+            continue
+        college = profile.college
+        existing.append({
+            'email': email,
+            'college': college.name if college else '',
+            'website': (college.website or '') if college else '',
+            'same_college': bool(college and college.pk == institution.pk),
+        })
+    return JsonResponse({'existing': existing, 'available': len(wanted) - len(existing)})
+
+
+@require_POST
+def students_add(request):
+    """Create candidate profiles for a list of student email addresses.
+
+    POST /api/students/add/  {"emails": ["a@college.edu", ...]}
+        ->  {created, skipped, invalid, total}
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'Only institution staff can add students.'}, status=403,
+        )
+
+    try:
+        data = json.loads(request.body or '{}')
+    except ValueError:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+    if not isinstance(data, dict):
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    wanted, invalid = _requested_student_emails(data)
+    if wanted is None:
+        return JsonResponse({'detail': 'Send a list of emails as "emails".'}, status=400)
+
+    if not wanted:
+        if invalid:
+            return JsonResponse(
+                {'detail': 'None of those are valid email addresses.'}, status=400,
+            )
+        return JsonResponse(
+            {'detail': 'Send a list of emails as "emails".'}, status=400,
+        )
+    if len(wanted) > MAX_STUDENTS_PER_REQUEST:
+        return JsonResponse(
+            {
+                'detail': (
+                    f'Add at most {MAX_STUDENTS_PER_REQUEST} students at a time.'
+                ),
+            },
+            status=400,
+        )
+
+    created, skipped = 0, 0
+    with transaction.atomic():
+        for email in wanted:
+            # The email is the username across this project (see signup), so a
+            # repeat submission lands on the same account rather than forking a
+            # second student out of one person.
+            user, user_created = User.objects.get_or_create(
+                username=email, defaults={'email': email},
+            )
+            if user_created:
+                # An unusable password leaves the account unable to sign in
+                # until the student sets one, rather than shipping a shared
+                # default anyone could guess.
+                user.set_unusable_password()
+                user.save(update_fields=['password'])
+
+            existing = CandidateProfile.objects.filter(user=user).first()
+            if existing is not None:
+                # Already on someone's roll. Never move a student between
+                # colleges as a side effect of an import.
+                skipped += 1
+                continue
+
+            CandidateProfile.objects.create(
+                user=user, college=institution, personal_email=email,
+            )
+            created += 1
+
+    return JsonResponse({
+        'created': created,
+        'skipped': skipped,
+        'invalid': invalid,
+        'total': CandidateProfile.objects.filter(college=institution).count(),
     })
 
 
@@ -14258,14 +15596,13 @@ def student_messages(request, student_id):
 
 @require_GET
 def drives_list(request):
-    """Placement drives for the client, derived from the recorded Company rows.
+    """Placement drives recorded for the signed-in staff's institution.
 
     GET /api/drives/  ->  {drives, count, drive_count}
     Each drive carries the number of genuinely-eligible candidates so the
-    placement team can line the right students up for the company.
-    ``count`` is how many company rows back the listing, while ``drive_count``
-    is how many Drive records the college actually has on file - the page shows
-    that as the "Total Drives" figure.
+    placement team can line the right students up for the company. A drive only
+    exists once the recruiter has actually gone to hire, so this listing is the
+    record of hiring events rather than of registered companies.
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
@@ -14273,20 +15610,292 @@ def drives_list(request):
     if institution is None:
         return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
 
-    companies = Company.objects.filter(institution=institution).order_by('-campus_visit_date', '-created_at')
-    drive_totals = _drive_totals_by_company(companies)
-    drives = []
-    for company in companies:
-        drives.append(_drive_payload(
-            company,
-            _eligible_student_count(institution, company),
-            drive_totals.get(company.pk, {}).get('openings', 0),
-        ))
+    drives_qs = (
+        Drive.objects
+        .filter(institution=institution)
+        .select_related('company')
+        .order_by('-visit_date', '-created_at')
+    )
+    drives = [
+        _drive_payload(
+            drive,
+            _eligible_student_count(institution, drive),
+            drive.vacancies,
+        )
+        for drive in drives_qs
+    ]
     return JsonResponse({
         'drives': drives,
         'count': len(drives),
-        'drive_count': Drive.objects.filter(institution=institution).count(),
+        'drive_count': len(drives),
     })
+
+
+# Shared field coercion for the create and edit endpoints. Both take the same
+# payload shape, so the "ignore garbage, fall back to a sane value" rules are
+# defined once here rather than drifting apart between the two.
+def _drive_field_coercers():
+    def _as_int(value):
+        if value is None or value == '':
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _as_decimal(value):
+        if value is None or value == '':
+            return None
+        try:
+            return Decimal(str(value))
+        except (TypeError, ValueError, InvalidOperation):
+            return None
+
+    def _as_date(value):
+        if not value:
+            return None
+        try:
+            return datetime.date.fromisoformat(str(value).strip()[:10])
+        except ValueError:
+            return None
+
+    def _as_str_list(value):
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str) and value.strip():
+            return [v.strip() for v in value.split(',') if v.strip()]
+        return []
+
+    def _as_choice(value, choices, default):
+        """Keep only a real choice value; anything else falls back to the default."""
+        allowed = {key for key, _ in choices}
+        candidate = str(value or '').strip()
+        return candidate if candidate in allowed else default
+
+    def _as_role(value):
+        """Normalise the incoming role down to a single name.
+
+        A drive hires for exactly one role. Older clients posted a list or a
+        comma-separated string, so the first entry is kept rather than rejecting
+        the request - a company that wants two roles schedules two drives.
+        """
+        if isinstance(value, dict):
+            value = value.get('title', '')
+        if isinstance(value, (list, tuple)):
+            value = next((v for v in value if str(v).strip()), '')
+        return str(value or '').strip()[:255]
+
+    return {
+        'int': _as_int,
+        'decimal': _as_decimal,
+        'date': _as_date,
+        'str_list': _as_str_list,
+        'choice': _as_choice,
+        'role': _as_role,
+    }
+
+
+def _read_drive_payload(data, coercer):
+    """Coerce a submitted drive body into a dict of model-ready field values.
+
+    Only keys actually present in the body are returned, so a partial edit
+    leaves the untouched columns exactly as they were.
+    """
+    present = lambda key: key in data
+    out = {}
+    for key, reader in (
+        ('role', coercer['role']),
+        ('total_vacancies', coercer['int']),
+        ('visit_date', coercer['date']),
+        ('application_deadline', coercer['date']),
+        ('work_location', lambda v: str(v or '').strip()),
+        ('salary_min', coercer['decimal']),
+        ('salary_max', coercer['decimal']),
+        ('eligible_branches', coercer['str_list']),
+        ('eligible_courses', coercer['str_list']),
+        ('minimum_cgpa', coercer['decimal']),
+        ('maximum_backlogs', coercer['int']),
+        ('graduation_year', coercer['int']),
+        ('required_skills', coercer['str_list']),
+        ('preferred_skills', coercer['str_list']),
+        ('selection_rounds', coercer['str_list']),
+    ):
+        if present(key):
+            out[key] = reader(data.get(key))
+    for key, choices, default in (
+        ('drive_mode', DRIVE_MODE_CHOICES, 'campus'),
+        ('status', RECRUITMENT_STATUS_CHOICES, 'upcoming'),
+        ('work_mode', WORK_MODE_CHOICES, 'onsite'),
+        ('placement_mode', PLACEMENT_MODE_CHOICES, 'full_time'),
+        ('offer_status', OFFER_STATUS_CHOICES, 'pending'),
+    ):
+        if present(key):
+            out[key] = coercer['choice'](data.get(key), choices, default)
+    return out
+
+
+@require_http_methods(["PATCH", "PUT"])
+def drive_edit(request, drive_id):
+    """Amend one existing placement drive.
+
+    PATCH /api/drives/<id>/  ->  {"drive": {...}}
+
+    The create endpoint is a one-shot POST, but a drive keeps moving after it is
+    scheduled: the deadline slips, openings are revised, the status advances from
+    upcoming to ongoing to completed, offers are made or revoked. This endpoint
+    is how staff record that, without deleting and re-creating the drive and
+    losing the identity the selection rounds hang off.
+
+    Only the columns present in the body are written, so a partial edit never
+    blanks out a field the caller did not send. The company is deliberately not
+    editable here: it is the drive's identity, and moving a drive to a different
+    recruiter is a different operation from amending its terms.
+
+    Scoped to the signed-in staff's own institution, exactly as creation is, so a
+    college can never amend another college's drive.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'Only institution staff can edit drives.'}, status=403,
+        )
+
+    drive = Drive.objects.filter(pk=drive_id, institution=institution).first()
+    if drive is None:
+        return JsonResponse({'detail': 'Drive not found.'}, status=404)
+
+    try:
+        data = json.loads(request.body or '{}')
+    except ValueError:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+    if not isinstance(data, dict):
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    if 'title' in data:
+        title = str(data.get('title') or '').strip()
+        if not title:
+            return JsonResponse({'detail': 'Drive title cannot be blank.'}, status=400)
+        drive.title = title[:255]
+
+    for field, value in _read_drive_payload(data, _drive_field_coercers()).items():
+        setattr(drive, field, value)
+
+    drive.save()
+    return JsonResponse({
+        'drive': _drive_payload(
+            drive, _eligible_student_count(institution, drive), drive.vacancies,
+        ),
+    })
+
+
+@require_POST
+def drive_create(request):
+    """Schedule one placement drive for an already-registered company.
+
+    POST /api/drives/create/  ->  {"drive": {...}}
+
+    This is the second half of the Company/Drive split. A company is registered
+    once, on /api/companies/create/, and holds only the long-lived relationship.
+    Everything about a single hiring event - the roles, the dates, the selection
+    rounds, the status - is recorded here instead, so a recruiter can sit
+    registered indefinitely before they actually go to hire, and the same company
+    can run several drives with different terms.
+
+    Only institution staff with a ClientProfile can schedule drives, and the
+    company must already be registered against the same institution, so a drive
+    can never be attached to another institution's recruiter.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'Only institution staff can schedule drives.'}, status=403,
+        )
+
+    client = ClientProfile.objects.filter(user=request.user).first()
+    if client is None:
+        return JsonResponse(
+            {'detail': 'A client profile is required to schedule drives.'}, status=403,
+        )
+
+    try:
+        data = json.loads(request.body or '{}')
+    except ValueError:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+    if not isinstance(data, dict):
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    title = str(data.get('title', '')).strip()
+    if not title:
+        return JsonResponse({'detail': 'Drive title is required.'}, status=400)
+
+    company_pk = str(data.get('company', '')).strip()
+    if not company_pk:
+        return JsonResponse(
+            {'detail': 'Pick a registered company for this drive.'}, status=400,
+        )
+    company = None
+    if company_pk.isdigit():
+        company = Company.objects.filter(
+            pk=int(company_pk), institution=institution,
+        ).first()
+    if company is None:
+        return JsonResponse(
+            {'detail': 'That company is not registered with your institution.'},
+            status=400,
+        )
+
+    # The same coercion rules the edit endpoint uses, so a drive created and a
+    # drive amended can never disagree about what a valid field looks like.
+    coercer = _drive_field_coercers()
+    _as_int = coercer['int']
+    _as_decimal = coercer['decimal']
+    _as_date = coercer['date']
+    _as_str_list = coercer['str_list']
+    _as_choice = coercer['choice']
+    _as_role = coercer['role']
+
+    drive = Drive.objects.create(
+        institution=institution,
+        company=company,
+        created_by=request.user,
+        title=title,
+        role=_as_role(data.get('role') if data.get('role') is not None else data.get('roles')),
+        total_vacancies=_as_int(data.get('total_vacancies')),
+        drive_mode=_as_choice(data.get('drive_mode'), DRIVE_MODE_CHOICES, 'campus'),
+        status=_as_choice(data.get('status'), RECRUITMENT_STATUS_CHOICES, 'upcoming'),
+        visit_date=_as_date(data.get('visit_date')),
+        application_deadline=_as_date(data.get('application_deadline')),
+        work_mode=_as_choice(data.get('work_mode'), WORK_MODE_CHOICES, 'onsite'),
+        work_location=str(data.get('work_location', '')).strip()
+        or company.work_location,
+        salary_min=_as_decimal(data.get('salary_min'))
+        if _as_decimal(data.get('salary_min')) is not None else company.salary_min,
+        salary_max=_as_decimal(data.get('salary_max'))
+        if _as_decimal(data.get('salary_max')) is not None else company.salary_max,
+        eligible_branches=_as_str_list(data.get('eligible_branches')),
+        eligible_courses=_as_str_list(data.get('eligible_courses')),
+        minimum_cgpa=_as_decimal(data.get('minimum_cgpa')),
+        maximum_backlogs=_as_int(data.get('maximum_backlogs')),
+        graduation_year=_as_int(data.get('graduation_year')),
+        required_skills=_as_str_list(data.get('required_skills')),
+        preferred_skills=_as_str_list(data.get('preferred_skills')),
+        selection_rounds=_as_str_list(data.get('selection_rounds')),
+        placement_mode=_as_choice(
+            data.get('placement_mode'), PLACEMENT_MODE_CHOICES, 'full_time',
+        ),
+        offer_status=_as_choice(data.get('offer_status'), OFFER_STATUS_CHOICES, 'pending'),
+    )
+    return JsonResponse({
+        'drive': _drive_payload(
+            drive, _eligible_student_count(institution, drive), drive.vacancies,
+        ),
+    }, status=201)
 
 
 @require_GET
@@ -14296,10 +15905,9 @@ def drives_total_vacancies(request):
     GET /api/drives/total-vacancies/
         ->  {"total_vacancies": <int>, "drive_count": <int>, "institution": "<name>"|null}
 
-    Sums Drive.vacancies over the college's drives - the stored
-    Drive.total_vacancies per drive when set, otherwise the sum of the
-    per-role vacancy counts in Drive.roles. Cancelled and completed drives are
-    included; pass ?status=ongoing to narrow it to one status.
+    Sums Drive.vacancies over the college's drives - each drive carries one role
+    and its own total_vacancies. Cancelled and completed drives are included;
+    pass ?status=ongoing to narrow it to one status.
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
@@ -14326,7 +15934,7 @@ def drives_total_vacancies(request):
 
     return JsonResponse({
         'total_vacancies': _sum_drive_vacancies(
-            drives.values_list('total_vacancies', 'roles')
+            drives.values_list('total_vacancies', flat=True)
         ),
         'drive_count': drives.count(),
         'institution': institution.name,
@@ -14349,9 +15957,7 @@ def reports_data(request):
     companies = Company.objects.filter(institution=institution)
     total = candidates.count()
     placed = candidates.filter(placement_status='placed').count()
-    eligible = _with_effective_eligibility(candidates).filter(
-        effective_eligible=True, cgpa__isnull=False,
-    ).count()
+    eligible = _eligible_candidates(candidates).count()
     ctc_float = [float(c) for c in candidates.exclude(expected_ctc__isnull=True).values_list('expected_ctc', flat=True)]
 
     kpis = {

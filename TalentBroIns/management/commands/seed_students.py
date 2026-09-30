@@ -84,7 +84,6 @@ class Command(BaseCommand):
 
             cgpa = round(5.6 + ((i * 7919) % 410) / 100.0, 2)
             status = cgpa_to_status(cgpa)
-            eligible = cgpa >= 6.0 or status in ("placed", "shortlisted")
             skills = SKILL_POOL[i % len(SKILL_POOL)]
             preferred_roles = role_hint if status != "not_started" else []
             expected_ctc = round(4.0 + ((i * 13) % 14), 1) if status in ("placed", "shortlisted") else None
@@ -118,7 +117,6 @@ class Command(BaseCommand):
                     "gender": GENDERS[i % len(GENDERS)],
                     "cgpa": cgpa,
                     "placement_status": status,
-                    "placement_eligible": eligible,
                     "skills": skills,
                     "preferred_roles": preferred_roles,
                     "preferred_locations": ["Pune", "Bengaluru", "Hyderabad"],

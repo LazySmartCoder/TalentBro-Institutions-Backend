@@ -144,8 +144,7 @@ class CompanyInline(admin.TabularInline):
         'company_name',
         'industry',
         'tier',
-        'recruitment_status',
-        'offer_status',
+        'work_location',
     )
     readonly_fields = ('company_id',)
 
@@ -201,25 +200,17 @@ class CompanyAdmin(admin.ModelAdmin):
         'tier',
         'institution',
         'client',
-        'recruitment_status',
-        'placement_mode',
-        'offer_status',
-        'campus_visit_date',
+        'created_at',
     )
     list_filter = (
         'tier',
         'industry',
-        'work_mode',
-        'recruitment_status',
-        'placement_mode',
-        'offer_status',
         'institution',
     )
     search_fields = (
         'company_id',
         'company_name',
         'industry',
-        'work_location',
         'institution__name',
         'client__full_name',
     )
@@ -234,17 +225,35 @@ class CompanyAdmin(admin.ModelAdmin):
                 'company_description',
             ),
         }),
-        ('Drive Details', {
+        ('AI profile', {
+            'fields': ('company_ai_info',),
+            'description': (
+                'Written by Gemini automatically when the company is registered '
+                'via the /companies form, not typed by hand. It is a LIST of '
+                'blocks, each with exactly these four keys:\n'
+                '[{"name": ..., "short_desc": ..., "known_for": ..., '
+                '"big_desc": ...}]\n'
+                'Each block is a short label, a one-line summary, what the '
+                'company is known for, and a longer paragraph. A re-generation '
+                'appends a new block rather than replacing the old one. Safe to '
+                'correct by hand: the API drops any block that is not an object '
+                'or is missing "name".'
+            ),
+        }),
+        ('Relationship', {
             'fields': (
                 'institution',
                 'client',
                 'tier',
-                'job_roles',
                 'work_location',
-                'work_mode',
                 'salary_min',
                 'salary_max',
                 'graduation_year',
+            ),
+            'description': (
+                'This is the standing recruiter relationship. Roles, skills, '
+                'dates, selection rounds, status and offer state belong to a '
+                'Drive, created when the company actually hires.'
             ),
         }),
         ('Eligibility', {
@@ -253,18 +262,6 @@ class CompanyAdmin(admin.ModelAdmin):
                 'eligible_branches',
                 'minimum_cgpa',
                 'maximum_backlogs',
-                'required_skills',
-                'preferred_skills',
-            ),
-        }),
-        ('Schedule', {
-            'fields': (
-                'application_deadline',
-                'campus_visit_date',
-                'selection_rounds',
-                'recruitment_status',
-                'placement_mode',
-                'offer_status',
             ),
         }),
         ('Meta', {
@@ -312,11 +309,12 @@ class DriveAdmin(admin.ModelAdmin):
                 'application_deadline',
             ),
         }),
-        ('Roles & Vacancies', {
-            'fields': ('roles', 'total_vacancies', 'selection_rounds'),
+        ('Role & Vacancies', {
+            'fields': ('role', 'total_vacancies', 'selection_rounds'),
             'description': (
-                'roles is a list of {"title", "description", "vacancies"} '
-                'objects. Leave total_vacancies blank to sum the roles.'
+                'One role per drive. A company hiring for two roles schedules '
+                'two drives. Leave total_vacancies blank when the count is not '
+                'known yet.'
             ),
         }),
         ('Package', {
@@ -335,6 +333,17 @@ class DriveAdmin(admin.ModelAdmin):
                 'maximum_backlogs',
                 'graduation_year',
                 'required_skills',
+                'preferred_skills',
+            ),
+        }),
+        ('Engagement', {
+            'fields': (
+                'placement_mode',
+                'offer_status',
+            ),
+            'description': (
+                'placement_mode is what this particular visit offers, and '
+                'offer_status is where its offers stand.'
             ),
         }),
         ('Meta', {
@@ -355,7 +364,6 @@ class CandidateProfileAdmin(admin.ModelAdmin):
         'start_year',
         'end_year',
         'placement_status',
-        'placement_eligible',
         'id_verified',
         'cost_incurred',
         'time_spent',
@@ -367,7 +375,6 @@ class CandidateProfileAdmin(admin.ModelAdmin):
         'end_year',
         'gender',
         'placement_status',
-        'placement_eligible',
         'account_status',
         'id_verified',
     )
@@ -423,30 +430,13 @@ class CandidateProfileAdmin(admin.ModelAdmin):
                 'enrichment AI update it.'
             ),
         }),
-        ('Eligibility (readiness rule)', {
-            'fields': (
-                'placement_eligible',
-            ),
-            'classes': ('collapse',),
-            'description': (
-                'Every eligible figure across the dashboards, reports, drives '
-                'and student records resolves the same rule: use this override '
-                'when set, otherwise the student is eligible once their '
-                'readiness score reaches 40. Leave it blank for the normal case '
-                '(the override is then None, not False — that distinction is '
-                'the whole point). Set Yes to force a student eligible or No to '
-                'force them ineligible regardless of score. A student with no '
-                'readiness activity counts as 50, so they stay eligible until '
-                'they have been assessed. The enrichment AI cannot write this '
-                'field; only this form can.'
-            ),
-        }),
         ('Experience & Profile', {
             'fields': (
                 'skills',
                 'certifications',
                 'projects',
                 'internships',
+                'extracurricular_activities',
             ),
         }),
         ('Preferences', {
@@ -514,7 +504,15 @@ class MockInterviewMessageInline(admin.TabularInline):
 
 @admin.register(MockInterview)
 class MockInterviewAdmin(admin.ModelAdmin):
-    list_display = ('company_name', 'user_name', 'role', 'status', 'message_count', 'updated_at')
+    list_display = (
+        'company_name',
+        'user_name',
+        'role',
+        'status',
+        'suspection',
+        'message_count',
+        'updated_at',
+    )
     list_filter = ('status',)
     search_fields = ('company_name', 'role', 'user__email', 'user__first_name', 'user__last_name')
     autocomplete_fields = ('user',)

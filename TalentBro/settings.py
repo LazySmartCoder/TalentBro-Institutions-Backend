@@ -238,6 +238,14 @@ GEMINI_ONBOARDING_MODEL = os.environ.get(
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '').strip()
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'whisper-large-v3-turbo').strip()
 
-# LinkedIn profile photo enrichment via the Apify linkedin-profile-scraper actor.
-# Used by the candidate "Complete profile" flow to fetch the profile photo URL.
+# LinkedIn profile scraping via Apify. Used by the candidate "Complete profile"
+# flow (photo + headline) and by the resume builder (the whole profile).
 APIFY_TOKEN = os.environ.get('APIFY_TOKEN', '').strip()
+# Which Apify actor to scrape with. The default, calm_builder~linkedin-profile-
+# scraper, reads only what LinkedIn shows logged-out visitors, so it needs no
+# session cookies but returns fewer sections (no certifications, skills, projects
+# or languages). Point this at a richer signed-in actor, and supply its cookies,
+# if a resume needs the full section set.
+APIFY_LINKEDIN_ACTOR = os.environ.get(
+    'APIFY_LINKEDIN_ACTOR', 'calm_builder~linkedin-profile-scraper',
+).strip()

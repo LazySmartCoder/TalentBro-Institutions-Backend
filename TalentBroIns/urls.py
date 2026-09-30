@@ -20,13 +20,38 @@ urlpatterns = [
     path('institutions/companies/', views.institution_companies, name='institution-companies'),
     path('companies/', views.companies_list, name='companies-list'),
     path('companies/create/', views.company_create, name='company-create'),
+    path('companies/<int:company_id>/update/', views.company_update, name='company-update'),
     path('candidate/companies/', views.candidate_companies, name='candidate-companies'),
+    path(
+        'candidate/company-drives/',
+        views.candidate_company_drives,
+        name='candidate-company-drives',
+    ),
+    path(
+        'candidate/company-drives/<int:company_id>/',
+        views.candidate_company_drive_detail,
+        name='candidate-company-drive-detail',
+    ),
     path('institution/overview/', views.institution_overview, name='institution-overview'),
     path('students/', views.students_list, name='students-list'),
+    path('students/add/', views.students_add, name='students-add'),
+    path('students/check/', views.students_check, name='students-check'),
     path('readiness/leaderboard/', views.readiness_leaderboard, name='readiness-leaderboard'),
     path('students/<uuid:student_id>/messages/', views.student_messages, name='student-messages'),
     path('drives/', views.drives_list, name='drives-list'),
+    path('drives/create/', views.drive_create, name='drive-create'),
+    path(
+        'drives/<int:drive_id>/',
+        views.drive_edit,
+        name='drive-edit',
+    ),
     path('drives/total-vacancies/', views.drives_total_vacancies, name='drives-total-vacancies'),
+    path('placement-cell/members/', views.placement_cell_members, name='placement-cell-members'),
+    path(
+        'placement-cell/members/create/',
+        views.placement_cell_member_create,
+        name='placement-cell-member-create',
+    ),
     path('reports/', views.reports_data, name='reports-data'),
     path('courses/', views.courses_list, name='courses-list'),
     path('courses/segments/', views.course_weakness_segments, name='course-weakness-segments'),
@@ -86,6 +111,9 @@ urlpatterns = [
 
     path('chat/tts/', views.tts, name='tts'),
     path('chat/tts/voices/', views.tts_voices, name='tts-voices'),
+
+    path('resume/build/', views.resume_build, name='resume-build'),
+    path('resume/download/', views.resume_download, name='resume-download'),
 
     # Read-only rollup behind the history screen. Declared ahead of the uuid
     # routes on purpose: "stats" is not a uuid, but keeping the literal paths

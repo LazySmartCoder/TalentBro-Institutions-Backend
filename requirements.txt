@@ -3,3 +3,8 @@ django-cors-headers==4.9.0
 python-dotenv==1.2.2
 requests==2.32.5
 edge-tts==7.2.8
+# Renders the generated resume to a downloadable PDF. Pure Python, so it needs
+# no system libraries (WeasyPrint, for example, needs cairo/pango).
+reportlab==5.0.1
+# Test-only: reads the generated PDF back so tests can assert on its text.
+pypdf==6.19.0
