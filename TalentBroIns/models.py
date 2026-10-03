@@ -1,6 +1,8 @@
 import random
+import re
 import uuid
 from decimal import Decimal
+from urllib.parse import urlparse
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -72,7 +74,9 @@ class Institution(models.Model):
     approximate_student_strength = models.PositiveIntegerField()
     courses_offered = models.JSONField(default=list)
     departments = models.CharField(max_length=255, blank=True, default='')
-    companies = models.TextField(blank=True, default='')
+    # The companies hiring here are not stored here. They are the Company rows
+    # linked to this institution, which is the only record that carries drives,
+    # rounds and eligibility alongside a name - a hand-typed list could not.
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -106,10 +110,19 @@ class Institution(models.Model):
 
 
 class ClientProfile(models.Model):
+    """A person who works at an institution: the account plus their staff record.
+
+    ``user`` is nullable because a placement-cell owner adds colleagues by
+    recording their work email first - the profile row is the roster entry, and
+    the person claims it by signing up with that same email (see the signup
+    view). A row with no ``user`` is an invite that has not been accepted yet.
+    """
+
     user = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='profile',
+        null=True, blank=True,
     )
     institution = models.ForeignKey(
         Institution,
@@ -197,6 +210,41 @@ COMPANY_TIER_CHOICES = [
 ]
 
 
+def company_website_origin(raw):
+    """Reduce a typed website to its `scheme://host` origin, or '' if unusable.
+
+    Shared by the model and the API so the value used for the stored website, the
+    one shown in the UI and the one the favicon is fetched from can never disagree.
+
+    Accepts the shapes staff actually paste - a bare domain, a deep link, mixed
+    case, a scheme-relative URL - and returns the origin, since that is the part
+    an icon lives under. A host must look like a host: `not a url` is rejected
+    outright rather than becoming `https://not a url` and a pointless lookup.
+    """
+    candidate = str(raw or '').strip()
+    if not candidate:
+        return ''
+    if ' ' in candidate:
+        return ''
+    if '://' not in candidate:
+        candidate = f'https://{candidate}'
+    try:
+        parts = urlparse(candidate)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        # Malformed authority, e.g. a port that is not a number.
+        return ''
+    if parts.scheme not in ('http', 'https') or not host:
+        return ''
+    # A hostname is letters, digits, dots and hyphens. This also rejects the
+    # unencoded characters that would make the origin unresolvable.
+    if not re.fullmatch(r'[a-z0-9.-]+', host, re.IGNORECASE):
+        return ''
+    authority = host if port is None else f'{host}:{port}'
+    return f'{parts.scheme.lower()}://{authority.lower()}'
+
+
 class Company(models.Model):
     """A recruiter the institution has a relationship with.
 
@@ -214,6 +262,28 @@ class Company(models.Model):
     company_name = models.CharField(max_length=255)
     industry = models.CharField(max_length=120, blank=True, default='')
     company_description = models.TextField(blank=True, default='')
+    # The recruiter's own site, as typed by staff. Free-text rather than a strict
+    # URL field on purpose: recruiters are recorded from links a placement cell
+    # was emailed, and those arrive with or without a scheme, with a path, or as
+    # a bare domain. Normalising happens on read (see Company.web_url) so the
+    # form stays forgiving and the stored value stays what staff actually typed.
+    website = models.CharField(
+        max_length=255, blank=True, default='',
+        help_text='Company website or homepage, as provided.',
+    )
+    # Absolute URL of the site icon, resolved from `website` at registration time.
+    #
+    # Deliberately a plain URL string, not a file field: favicons live on the
+    # company's own servers and there is no reason to copy them into our storage.
+    # The trade-off is that the row keeps whatever URL was current when the
+    # company was recorded; a site that later moves its icon shows a stale image
+    # until the company is re-saved. That is the right way round for this column -
+    # a re-save refreshes it, and a broken icon is far cheaper than a broken
+    # company page.
+    company_logo = models.CharField(
+        max_length=500, blank=True, default='',
+        help_text='Absolute URL of the company favicon, derived from the website.',
+    )
 
     # Still on the company record: the standing eligibility bar and salary band
     # a recruiter is known for, ahead of any specific drive. Drive carries its
@@ -301,6 +371,15 @@ class Company(models.Model):
 
     # The four keys every company_ai_info block must carry, in display order.
     AI_INFO_KEYS = ('name', 'short_desc', 'known_for', 'big_desc')
+
+    @property
+    def web_url(self):
+        """`website` as a safe absolute URL, or '' when there is not one.
+
+        See company_website_origin for the rules; this is the instance-level
+        convenience over it.
+        """
+        return company_website_origin(self.website)
 
     @property
     def ai_info_blocks(self):
@@ -616,10 +695,9 @@ class CandidateProfile(models.Model):
         choices=ACCOUNT_STATUS_CHOICES,
         default='active',
     )
-    # Set to True by the ID-card verification endpoint once Gemini confirms the
-    # student's name, registration number and college against the OCR text. The
-    # profile cannot be marked complete until this is True (compulsory step).
-    id_verified = models.BooleanField(default=False)
+    # NOTE: the ID-card verification verdict is deliberately NOT stored. The
+    # Gemini OCR check stays client-side in the onboarding flow, so no column
+    # can go stale relative to the ID card the student actually holds.
     last_login_at = models.DateTimeField(null=True, blank=True)
 
     # Total AI (Gemini) spend burnt by this candidate while using TalentBro,
@@ -785,6 +863,57 @@ class ChatMessage(models.Model):
     # reading in another language can follow along while the canonical reply
     # always stays in English. Empty for user turns and English replies.
     translation = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at', 'id']
+
+    def __str__(self):
+        return f'{self.role}: {self.content[:40]}'
+
+
+class ClientChatSession(models.Model):
+    """Persisted placement-officer↔TalentBro Gemini conversation.
+
+    Deliberately a separate table from :class:`ChatSession` rather than a shared
+    one. A placement officer's conversation about the institute roster is not the
+    officer's own student chat: mixing them would let roster conversations show
+    up in a student's history, let a student chat count towards the client-side
+    session list, and make the two histories impossible to reason about when the
+    student view and the placement view need different privacy rules. The shape
+    mirrors :class:`ChatSession` exactly (uuid pk, user, title, timestamps).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='client_chat_sessions',
+    )
+    title = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f'{self.title or "Untitled chat"} ({self.user.get_full_name() or self.user.username})'
+
+
+class ClientChatMessage(models.Model):
+    """A single turn inside a :class:`ClientChatSession`.
+
+    Simpler than :class:`ChatMessage` on purpose: there is no ``translation``
+    column because the placement assistant always answers in English, and the
+    preferred-language machinery belongs to the student chat.
+    """
+
+    session = models.ForeignKey(
+        ClientChatSession, on_delete=models.CASCADE, related_name='messages',
+    )
+    role = models.CharField(max_length=10, choices=CHAT_ROLE_CHOICES)
+    content = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -2096,3 +2225,57 @@ class InstitutionsResume(models.Model):
 
     def __str__(self):
         return f'{self.institute.name} — {self.department or "General"}'
+
+
+class ClassroomLDSession(models.Model):
+    """One classroom session an institution has scheduled for its students.
+
+    The L&D board reads these to show the faculty what is coming up and what has
+    already run. It is deliberately a plain schedule record rather than a
+    session attached to a practice model: the room, the hour and who is taking
+    it are what a placement officer needs, and nothing here is scored.
+
+    ``department`` is free text rather than a foreign key because it is typed
+    against the institution's own department names (Institution.departments is a
+    comma-separated string), and a session should be able to be campus-wide.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        Institution,
+        on_delete=models.CASCADE,
+        related_name='classroom_ld_sessions',
+    )
+    topic = models.CharField(max_length=255)
+    agenda = models.TextField(blank=True, default='')
+    venue = models.CharField(max_length=255, blank=True, default='')
+    department = models.CharField(max_length=255, blank=True, default='')
+    faculty_name = models.CharField(max_length=255, blank=True, default='')
+    starts_at = models.DateTimeField()
+    ends_at = models.DateTimeField()
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='classroom_ld_sessions_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'classroom_ld_session'
+        # Soonest first, so the board's default list reads as a timetable. The
+        # board flips this for the "done" list.
+        ordering = ['starts_at', 'topic']
+
+    def __str__(self):
+        return f'{self.topic[:60]} ({self.starts_at:%d %b %Y %H:%M})'
+
+    def clean(self):
+        super().clean()
+        if self.ends_at and self.starts_at and self.ends_at <= self.starts_at:
+            raise ValidationError(
+                {'ends_at': 'The session must end after it starts.'}
+            )

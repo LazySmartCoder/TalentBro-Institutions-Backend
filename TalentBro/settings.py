@@ -336,6 +336,11 @@ GEMINI_MOCK_INTERVIEW_MODEL = os.environ.get(
 GEMINI_ONBOARDING_MODEL = os.environ.get(
     'GEMINI_ONBOARDING_MODEL', 'gemini-2.5-flash-lite',
 ).strip()
+# Dedicated model for the placement-cell chat (client-chat) used by institution
+# staff; queries are read-only aggregates, so the cheap lite tier is enough.
+GEMINI_CLIENT_CHAT_MODEL = os.environ.get(
+    'GEMINI_CLIENT_CHAT_MODEL', 'gemini-2.5-flash-lite',
+).strip()
 
 # Groq Whisper OCR — free-tier speech-to-text used for voice training
 # transcription. If unset, the backend falls back to Gemini audio transcription.

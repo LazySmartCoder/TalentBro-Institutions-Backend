@@ -121,7 +121,6 @@ class Command(BaseCommand):
                     "preferred_roles": preferred_roles,
                     "preferred_locations": ["Pune", "Bengaluru", "Hyderabad"],
                     "expected_ctc": expected_ctc,
-                    "id_verified": (i % 7 != 0),  # ~85% verified like a real batch
                     "created_at": created_at,
                     "updated_at": created_at,
                 },

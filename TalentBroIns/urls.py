@@ -33,9 +33,32 @@ urlpatterns = [
         name='candidate-company-drive-detail',
     ),
     path('institution/overview/', views.institution_overview, name='institution-overview'),
+    path('institution/billing/', views.institution_billing, name='institution-billing'),
+    path('institution/update/', views.institution_update, name='institution-update'),
     path('students/', views.students_list, name='students-list'),
     path('students/add/', views.students_add, name='students-add'),
     path('students/check/', views.students_check, name='students-check'),
+    path('students/<uuid:student_id>/', views.student_data, name='student-data'),
+    path(
+        'student-activity/<uuid:student_id>/',
+        views.student_activity,
+        name='student-activity',
+    ),
+    path(
+        'student-interview/<uuid:interview_id>/evidence/',
+        views.student_interview_evidence,
+        name='student-interview-evidence',
+    ),
+    path(
+        'student-question/<uuid:session_id>/evidence/',
+        views.student_question_session_evidence,
+        name='student-question-evidence',
+    ),
+    path(
+        'student-english/<uuid:session_id>/evidence/',
+        views.student_english_session_evidence,
+        name='student-english-evidence',
+    ),
     path('readiness/leaderboard/', views.readiness_leaderboard, name='readiness-leaderboard'),
     path('students/<uuid:student_id>/messages/', views.student_messages, name='student-messages'),
     path('drives/', views.drives_list, name='drives-list'),
@@ -52,6 +75,26 @@ urlpatterns = [
         views.placement_cell_member_create,
         name='placement-cell-member-create',
     ),
+    path(
+        'placement-cell/members/<int:member_id>/',
+        views.placement_cell_member_detail,
+        name='placement-cell-member-detail',
+    ),
+    path(
+        'classroom-ld-sessions/',
+        views.classroom_ld_sessions,
+        name='classroom-ld-sessions',
+    ),
+    path(
+        'classroom-ld-sessions/create/',
+        views.classroom_ld_session_create,
+        name='classroom-ld-session-create',
+    ),
+    path(
+        'classroom-ld-sessions/<uuid:session_id>/',
+        views.classroom_ld_session_detail,
+        name='classroom-ld-session-detail',
+    ),
     path('reports/', views.reports_data, name='reports-data'),
     path('courses/', views.courses_list, name='courses-list'),
     path('courses/segments/', views.course_weakness_segments, name='course-weakness-segments'),
@@ -60,6 +103,12 @@ urlpatterns = [
     path('chat/sessions/', views.chat_sessions, name='chat-sessions'),
     path('chat/sessions/<uuid:session_id>/', views.chat_session_detail, name='chat-session-detail'),
     path('chat/summarize/', views.chat_summarize, name='chat-summarize'),
+    # Placement-cell ("client") chat. Separate routes and models from the student
+    # chat above: different persistence (ClientChatSession) and a data scope of
+    # one institution instead of one student.
+    path('client-chat/', views.client_chat, name='client-chat'),
+    path('client-chat/sessions/', views.client_chat_sessions, name='client-chat-sessions'),
+    path('client-chat/sessions/<uuid:session_id>/', views.client_chat_session_detail, name='client-chat-session-detail'),
     path('roadmap/', views.candidate_roadmap, name='candidate-roadmap'),
     path('chat/translate/', views.chat_translate, name='chat-translate'),
     path('chat/onboard/', views.chat_onboard, name='chat-onboard'),

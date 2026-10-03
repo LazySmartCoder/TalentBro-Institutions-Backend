@@ -1,4 +1,5 @@
 import base64
+import ast
 import datetime
 import json
 import logging
@@ -9,6 +10,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from collections import Counter
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
@@ -24,15 +26,16 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import transaction
-from django.db.models import Avg, BooleanField, Case, Count, F, Q, Sum, Value, When
+from django.db.models import Avg, BooleanField, Case, CharField, Count, F, Max, Q, Sum, Value, When
 from django.db.models.functions import Coalesce, Length
 from django.http import FileResponse, HttpResponse, JsonResponse
 from django.utils import timezone
 from django.utils.crypto import get_random_string
-from django.utils.dateparse import parse_date
+from django.utils.dateparse import parse_date, parse_datetime
 from django.utils.text import slugify
 from django.urls import reverse
 from django.middleware.csrf import get_token
+from urllib.parse import urlparse
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
@@ -43,6 +46,7 @@ from .weakness_segments import collect_weakness_segments
 from .gemini_cost import record_cost_incurred
 
 from .models import (
+    ACCOUNT_STATUS_CHOICES,
     APLRTraining,
     APLR_STATUS_ACTIVE,
     APLR_STATUS_GAVE_UP,
@@ -66,17 +70,22 @@ from .models import (
     DSA_STATUS_SOLVED,
     ChatMessage,
     ChatSession,
+    ClientChatMessage,
+    ClientChatSession,
     CandidateRoadmap,
+    ClassroomLDSession,
     ClientProfile,
     MOBILE_NUMBER_VALIDATOR,
     CommunicationTraining,
     Company,
     COMPANY_TIER_CHOICES,
+    company_website_origin,
     Drive,
     EnglishTraining,
     EnglishTrainingSession,
     GdTraining,
     COURSES_OFFERED,
+    COURSE_CHOICES,
     GENDER_CHOICES,
     INSTITUTION_TYPE_CHOICES,
     Institution,
@@ -127,6 +136,12 @@ GEMINI_MAX_TOOL_ROUNDS = 8
 GEMINI_READONLY_MAX_ROWS = 25
 GEMINI_SENSITIVE_COLUMNS = {'password', 'api_key', 'apikey', 'secret',
                             'secret_key', 'token', 'auth_token'}
+
+# Credit an institution prepaid towards its candidates' AI usage. The billing
+# screen bills the real sum of every candidate's `cost_incurred` and knocks this
+# advance off it, so the constant lives here (the single source both the
+# endpoint and any future invoicing code read) rather than only in the UI.
+BILLING_ADVANCE_PAID = Decimal('10000.00')
 
 # Gemini function-calling tools exposed to the chat model. They run server-side
 # with the authenticated user's identity: get_current_profile / query_database
@@ -534,6 +549,10 @@ def _user_payload(user, role=None):
     role = ROLE_ALIASES.get(role, role)
     missing = _guess_missing_profile(user)
     logo_url = ''
+    # What this person is called at work. Institution staff record a designation
+    # on their ClientProfile; students have no equivalent field, so the sidebar
+    # label falls back to the email it used to show.
+    designation = ''
     if role == ROLE_STUDENT:
         profile = getattr(user, 'candidate_profile', None)
         if profile and profile.college_id:
@@ -542,11 +561,14 @@ def _user_payload(user, role=None):
             logo_url = college.logo if college else ''
     elif institution is not None:
         logo_url = institution.logo
+        client_profile = ClientProfile.objects.filter(user_id=user.pk).only('designation').first()
+        designation = client_profile.designation if client_profile else ''
     return {
         'id': user.pk,
         'email': user.email,
         'name': user.get_full_name() or user.username,
         'avatar': _account_avatar(user, role),
+        'designation': designation,
         'institution': institution.name if institution else None,
         'institution_logo': logo_url,
         'role': role,
@@ -825,6 +847,41 @@ def csrf(request):
     return JsonResponse({'ok': True, 'csrfToken': get_token(request)})
 
 
+def _claim_profile_invite(user, full_name, email):
+    """Give a brand-new institution-staff account its ClientProfile.
+
+    A placement-cell owner adds colleagues by recording them on the roster
+    first, which creates a ClientProfile with no account attached. When one of
+    those people signs up with the invited address, this hands their new
+    account to the profile that was already waiting for it, so the college,
+    designation and access level set at invite time survive and no second
+    profile is forked.
+
+    Only an unclaimed row (no user) for the exact address is claimed, and never
+    one that already belongs to an account. Anyone else signing up as
+    institution staff gets a fresh profile, as before.
+    """
+    invited = (
+        ClientProfile.objects
+        .select_for_update()
+        .filter(user__isnull=True, official_email__iexact=email)
+        .order_by('created_at')
+        .first()
+    )
+    if invited is None:
+        ClientProfile.objects.get_or_create(
+            user=user,
+            defaults={'full_name': full_name, 'official_email': email},
+        )
+        return
+
+    invited.user = user
+    invited.official_email = email
+    if not invited.full_name:
+        invited.full_name = full_name
+    invited.save(update_fields=['user', 'official_email', 'full_name', 'updated_at'])
+
+
 @require_POST
 @transaction.atomic
 def signup(request):
@@ -885,10 +942,7 @@ def signup(request):
             defaults={'full_name': full_name, 'personal_email': email},
         )
     else:
-        ClientProfile.objects.get_or_create(
-            user=user,
-            defaults={'full_name': full_name, 'official_email': email},
-        )
+        _claim_profile_invite(user, full_name, email)
 
     if institution_name:
         # Best-effort: an Institution needs many more fields than a bare signup
@@ -1109,6 +1163,21 @@ def client_onboarding(request):
     # linked to the client (shared with the rest of their placement cell) so a
     # profile edit updates it instead of spawning a duplicate row.
     institution = _client_institution(user)
+    existing_profile = ClientProfile.objects.filter(user_id=user.pk).first()
+
+    # Staff who were added to an existing college by its placement cell (see
+    # _claim_profile_invite) already belong to a college, so this endpoint must
+    # not rewrite it: it only ever fills in the missing staff fields on their own
+    # profile. Access level is left exactly as the college set it at invite time.
+    if existing_profile is not None and existing_profile.institution_id:
+        existing_profile.mobile_number = profile_fields['mobile_number']
+        existing_profile.designation = profile_fields['designation']
+        existing_profile.employee_staff_id = profile_fields['employee_staff_id']
+        existing_profile.save(update_fields=[
+            'mobile_number', 'designation', 'employee_staff_id', 'updated_at',
+        ])
+        return JsonResponse({'user': _user_payload(user, user_role(user))})
+
     if institution is None:
         institution = Institution(user=user)
     institution.name = institution_fields['institution_name']
@@ -4831,24 +4900,6 @@ def _fallback_id_checks(submitted_name, submitted_registration, submitted_colleg
     return checks
 
 
-def _record_id_verification(user, verified):
-    """Persist the compulsory ID-card verification flag on the candidate profile.
-
-    Best-effort: a failure to persist never changes the verdict returned to the
-    client, but the profile-complete gate will keep ID verification "missing"
-    until it is recorded.
-    """
-    try:
-        profile, _ = CandidateProfile.objects.get_or_create(user=user)
-        if profile.id_verified != bool(verified):
-            profile.id_verified = bool(verified)
-            profile.save(update_fields=['id_verified', 'updated_at'])
-        return True
-    except Exception:
-        logger.warning('Failed to persist id_verified state for user %s.', user.pk)
-        return False
-
-
 @require_POST
 def verify_id_card(request):
     """Extract the name / registration number / college from the OCR text of a
@@ -5035,7 +5086,6 @@ def verify_id_card(request):
     if not valid_structure:
         fallback = _fallback_id_checks(name, registration_number, college, ocr_text)
         verified = all(ch['matched'] for ch in fallback.values())
-        _record_id_verification(request.user, verified)
         return JsonResponse({
             'extracted': {
                 'name': name,
@@ -5054,7 +5104,6 @@ def verify_id_card(request):
         for key in required_checks
     }
     verified = all(ch['matched'] for ch in checks.values())
-    _record_id_verification(request.user, verified)
     extracted_raw = parsed.get('extracted')
     extracted = (
         {k: v for k, v in extracted_raw.items() if k in ('name', 'registration_number', 'college')}
@@ -5089,8 +5138,13 @@ def _serialize_chat_session(instance, include_messages=False):
         'message_count': annotated if annotated is not None else instance.messages.count(),
     }
     if include_messages:
+        # ``translation`` only exists on the student ChatMessage; the placement
+        # chat's messages have no such column, so it is read defensively here and
+        # this serializer stays usable for both session models.
         data['messages'] = [
-            {'role': msg.role, 'content': msg.content, 'created_at': msg.created_at.isoformat()}
+            {'role': msg.role, 'content': msg.content,
+             'translation': getattr(msg, 'translation', ''),
+             'created_at': msg.created_at.isoformat()}
             for msg in instance.messages.all()
         ]
     return data
@@ -5390,13 +5444,23 @@ def _chat_institution_context(profile):
             lines.append(f'  - {label}: {value}')
     courses = institution.courses_offered or []
     departments = (institution.departments or '').strip()
-    companies = (institution.companies or '').strip()
     if courses:
         lines.append('  - courses offered: ' + ', '.join(str(c) for c in courses))
     if departments:
         lines.append('  - departments: ' + departments)
-    if companies:
-        lines.append('  - companies hiring here: ' + companies)
+    # Read from the Company rows rather than a list stored on the institution, so
+    # the names the student is shown are the companies that actually have drives
+    # on record for their college.
+    hiring = sorted(
+        set(
+            Company.objects.filter(institution=institution)
+            .values_list('company_name', flat=True)
+            .exclude(company_name='')
+            .distinct()
+        )
+    )
+    if hiring:
+        lines.append('  - companies hiring here: ' + ', '.join(hiring))
     return (
         'INSTITUTION REFERENCE (read-only, this student\'s college record):\n'
         + '\n'.join(lines)
@@ -10607,19 +10671,31 @@ def communication_transcribe(request):
     return JsonResponse({'text': text})
 
 
-def _run_agentic_turn(contents, system_prompt, gen_config, user):
+def _run_agentic_turn(contents, system_prompt, gen_config, user,
+                      functions=None, tool_runner=None, model=None):
     """Run chat until the model answers in text, allowing tool calls.
 
     Phase 1 allows the model a bounded number of function calls (profile lookup,
-    read-only SQL, and the profile write tool). Phase 2 â€” reached either when the
-    tool budget runs out or a request comes back empty â€” drops the tools and
+    read-only SQL, and the profile write tool). Phase 2 — reached either when the
+    tool budget runs out or a request comes back empty — drops the tools and
     nudges the model to close the turn from what it already fetched, guaranteeing
     a written answer.
     Returns ``(reply, status, detail)``; reply is falsy when the turn failed.
+
+    ``functions``/``tool_runner`` let a caller swap in its own tool surface: the
+    student chat uses the default (student-scoped profile tools), while the
+    placement chat passes institute-scoped tools that resolve against one
+    institution. The defaults keep the existing behaviour unchanged.
+
+    ``model`` likewise overrides the model for one surface only (the placement
+    chat uses :setting:`GEMINI_CLIENT_CHAT_MODEL`); ``None`` means the shared
+    student/mock-interview model.
     """
-    model = getattr(
+    declarations = functions if functions is not None else PROFILE_FUNCTIONS
+    run_tool = tool_runner if tool_runner is not None else _execute_chat_tool
+    model = (model or getattr(
         settings, 'GEMINI_MOCK_INTERVIEW_MODEL', 'gemini-3.1-flash-lite',
-    ).strip()
+    )).strip()
     api_key = getattr(settings, 'GEMINI_API_KEY', '').strip()
 
     close_prompt = (
@@ -10634,7 +10710,7 @@ def _run_agentic_turn(contents, system_prompt, gen_config, user):
             'generationConfig': gen_config,
         }
         if with_tools:
-            body['tools'] = [{'functionDeclarations': PROFILE_FUNCTIONS}]
+            body['tools'] = [{'functionDeclarations': declarations}]
             if tool_mode != 'AUTO':
                 body['toolConfig'] = {
                     'functionCallingConfig': {'mode': tool_mode},
@@ -10717,7 +10793,7 @@ def _run_agentic_turn(contents, system_prompt, gen_config, user):
                 responses.append({
                     'name': fc.get('name') or '',
                     'id': fc.get('id'),
-                    'response': _execute_chat_tool(part, user),
+                    'response': run_tool(part, user),
                 })
             # Echo the model's own parts (id / thoughtSignature must be returned
             # verbatim â€” the API rejects otherwise) then attach every result.
@@ -10920,6 +10996,1273 @@ def chat_session_detail(request, session_id):
             'role': m.role,
             'content': m.content,
             'translation': m.translation,
+            'created_at': m.created_at.isoformat(),
+        }
+        for m in newest
+    ]
+    data['older_available'] = older_available
+    return JsonResponse({'session': data})
+
+
+# ---------------------------------------------------------------------------
+# Placement-officer ("client") AI chat
+#
+# A separate conversation surface from the student chat above, for two reasons:
+#
+#   * Persistence. These threads live in their own ClientChatSession table, so a
+#     placement conversation never lands in a student's chat history and never
+#     counts towards one.
+#   * Data scope. The student chat is scoped to the signed-in student. This one
+#     is scoped to a single Institution, and every data source below filters on
+#     that one institute, so a placement officer can only ever see their own
+#     roster.
+#
+# The student chat hands the model a free-form read-only SQL tool; that is
+# deliberately NOT repeated here, because arbitrary SQL cannot be reliably
+# constrained to an institute. Instead the placement assistant gets purpose-built
+# read-only tools that scope server-side, plus an exact-arithmetic tool, so every
+# number in an answer comes from the database or from Python rather than from the
+# model doing mental maths over rows it invented.
+# ---------------------------------------------------------------------------
+
+# Page/window bounds. The always-on reference block stays small so a large
+# institute does not blow the prompt on every turn; the tools page whatever is
+# actually asked for.
+CLIENT_CHAT_ROSTER_BLOCK_MAX = 40
+CLIENT_CHAT_TOOL_MAX_ROWS = 200
+CLIENT_CHAT_GROUP_MAX = 40
+CLIENT_CHAT_RECENT_MOCKS = 5
+CLIENT_CHAT_RECENT_SESSIONS = 3
+CLIENT_CHAT_HISTORY_TURNS = 6
+
+_PLACEMENT_STATUS_LABELS = dict(PLACEMENT_STATUS_CHOICES)
+_RECRUITMENT_STATUS_LABELS = dict(RECRUITMENT_STATUS_CHOICES)
+
+# Self-training modules that share one shape: category / status /
+# points_awarded / star_rating / attempts / question. The status constants come
+# from each model so a module that ever renames a status is read correctly here
+# instead of silently counting zeros.
+_CLIENT_CHAT_QUESTION_MODULES = (
+    ('aplr', 'Aptitude & Logical Reasoning (APLR)', APLRTraining, APLR_STATUS_SOLVED),
+    ('basic_math', 'Basic Mathematics', BasicMathTraining, BASIC_MATH_STATUS_SOLVED),
+    ('situational', 'Situational Problem Solving', SituationalProblemSolvingTraining,
+     SITUATIONAL_STATUS_SOLVED),
+    ('technical', 'Technical / Coding', TechnicalTraining, TECH_STATUS_SOLVED),
+    ('dsa', 'Data Structures & Algorithms (DSA)', DSATraining, DSA_STATUS_SOLVED),
+)
+
+# The terminal "abandoned" status per module, kept beside the solved tuple above
+# so a renamed status cannot silently turn into a count of zero.
+_CLIENT_CHAT_GAVE_UP_STATUS = {
+    'aplr': APLR_STATUS_GAVE_UP,
+    'basic_math': BASIC_MATH_STATUS_GAVE_UP,
+    'situational': SITUATIONAL_STATUS_GAVE_UP,
+    'technical': TECH_STATUS_GAVE_UP,
+    'dsa': DSA_STATUS_GAVE_UP,
+}
+
+CLIENT_CHAT_FUNCTIONS = [
+    {
+        'name': 'list_institution_students',
+        'description': (
+            'List students of YOUR OWN institution, optionally filtered, newest '
+            'filter first. Returns each student\'s name, department, program, '
+            'batch year, CGPA, placement status, whether they are placement '
+            'eligible, and their readiness / mock-interview / self-training '
+            'scores and ranks. Use this for "which students...", "who is not '
+            'placed yet", "list everyone in CSE". Only your own institute\'s '
+            'students are ever returned.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'department': {'type': 'string',
+                               'description': 'Exact department name to filter by.'},
+                'program': {'type': 'string',
+                            'description': 'Exact program/course name to filter by.'},
+                'placement_status': {
+                    'type': 'string',
+                    'enum': [value for value, _ in PLACEMENT_STATUS_CHOICES],
+                    'description': 'Filter by placement status.',
+                },
+                'eligible_only': {
+                    'type': 'boolean',
+                    'description': 'True returns only placement-eligible students.',
+                },
+                'not_placed_only': {
+                    'type': 'boolean',
+                    'description': 'True returns only students who are not placed yet.',
+                },
+                'min_readiness_score': {'type': 'number',
+                                        'description': 'Minimum readiness score (0-100).'},
+                'max_readiness_score': {'type': 'number',
+                                        'description': 'Maximum readiness score (0-100).'},
+                'has_mock_interview': {
+                    'type': 'boolean',
+                    'description': 'True returns only students who have a mock-interview score.',
+                },
+                'has_self_training': {
+                    'type': 'boolean',
+                    'description': 'True returns only students who have a self-training score.',
+                },
+                'limit': {'type': 'integer',
+                          'description': 'Maximum rows to return (default 25, max 200).'},
+            },
+        },
+    },
+    {
+        'name': 'get_student_placement_detail',
+        'description': (
+            'Full placement record for ONE student of your own institution: '
+            'profile, readiness breakdown and ranks, mock interviews with their '
+            'analysis, self-training progress per module, and platform usage. '
+            'Identify the student by "student_id" (the candidate id or the user '
+            'id) or by "name". Use this when you need a single student\'s detail '
+            'rather than a list.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'student_id': {
+                    'type': 'string',
+                    'description': 'Candidate id or user id of the student.',
+                },
+                'name': {
+                    'type': 'string',
+                    'description': 'Full or partial student name, used when no id is known.',
+                },
+            },
+        },
+    },
+    {
+        'name': 'aggregate_institute_data',
+        'description': (
+            'Group YOUR OWN institute\'s students and return per-group totals: '
+            'student count, placed / shortlisted / applying / ineligible counts, '
+            'how many have mock-interview and self-training scores, average CGPA, '
+            'average readiness, average mock-interview score, average '
+            'self-training score, average expected CTC, average time spent on '
+            'the platform and total AI spend. Use this for every "how many", '
+            '"what percentage", "average", "compare departments" question — it '
+            'is the exact, authoritative source for statistics. Use '
+            '"group_by": "department" for department-wise, "placement_status", '
+            '"program", "end_year", "eligibility" or "readiness_band" otherwise.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'group_by': {
+                    'type': 'string',
+                    'enum': ['department', 'program', 'placement_status', 'end_year',
+                             'eligibility', 'readiness_band', 'account_status'],
+                    'description': 'How to group the institute roster.',
+                },
+                'department': {'type': 'string',
+                               'description': 'Restrict the aggregate to one department.'},
+                'limit': {'type': 'integer',
+                          'description': 'Maximum groups to return (default 40).'},
+            },
+        },
+    },
+    {
+        'name': 'list_institute_drives',
+        'description': (
+            'List placement drives and hiring companies for YOUR OWN institution, '
+            'optionally filtered by status. Returns title, company, role, drive '
+            'and recruitment status, visit date, application deadline, vacancies '
+            'and salary range. Use this for drive/deadline/company questions.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'status': {
+                    'type': 'string',
+                    'enum': [value for value, _ in RECRUITMENT_STATUS_CHOICES],
+                    'description': 'Filter by drive status.',
+                },
+                'company': {'type': 'string',
+                            'description': 'Partial company name to filter by.'},
+                'limit': {'type': 'integer',
+                          'description': 'Maximum drives to return (default 25, max 200).'},
+            },
+        },
+    },
+    {
+        'name': 'calculate',
+        'description': (
+            'Evaluate one arithmetic expression exactly and return the result. '
+            'Use this for every calculation in an answer — percentages, '
+            'averages, differences, growth, sums over rows you already fetched — '
+            'so the numbers you report are computed rather than estimated. '
+            'Supports + - * / // % **, parentheses, and the functions round(), '
+            'min(), max(), abs(), sum(), floor(), ceil(), sqrt().'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'expression': {
+                    'type': 'string',
+                    'description': (
+                        'The arithmetic expression to evaluate, with the numbers '
+                        'substituted in literally, e.g. "(12 / 30) * 100". Bare '
+                        'names such as "placed" or "total" are not accepted — '
+                        'replace them with the figures you fetched.'
+                    ),
+                },
+            },
+            'required': ['expression'],
+        },
+    },
+]
+
+CLIENT_CHAT_SYSTEM_PROMPT = """You are TalentBro, the AI placement-cell assistant working with a \
+placement officer at {institution_name}.
+
+WHAT YOU CAN DO
+- Answer questions about YOUR OWN institution's students: placement status, \
+readiness and eligibility, department/batch/program-wise placement rates, \
+CGPAs, expected CTCs and platform usage.
+- Report mock-interview and self-training performance: how many students have \
+attempted them, how they scored, which skills/dimensions are weakest, and what \
+a specific student's record shows.
+- Report drives and hiring companies for the institute: live/upcoming drives, \
+deadlines, vacancies, salary ranges, tier of the recruiter.
+- Do exact arithmetic: percentages, placement rates, averages, differences and \
+comparisons.
+
+HOW TO WORK
+1. Every number in your answer must come from a tool. Never estimate, never \
+invent a student, a company, a score or a count. Call \
+`list_institution_students`, `aggregate_institute_data`, \
+`get_student_placement_detail` or `list_institute_drives` before stating a \
+figure.
+2. `aggregate_institute_data` is the authoritative source for statistics and \
+rates; `list_institution_students` is the authoritative source for "which \
+students" lists. Prefer them over anything in the reference context, which is \
+only a snapshot.
+3. Do all arithmetic with the `calculate` tool, and quote the result. Never do \
+mental maths on numbers you just fetched. The calculator only accepts literal \
+numbers, so substitute the figures you fetched into the expression rather than \
+passing names.
+4. If a tool returns nothing for a filter, say plainly that no student in your \
+institute matches, and suggest a looser filter. Do not fill the gap with \
+guesses.
+5. Student identifiers: refer to students by name, and by department/program \
+when that is clearer.
+
+SCOPE AND PRIVACY — NOT NEGOTIABLE
+- You can only ever see {institution_name}'s own data. Every tool is already \
+restricted to this one institute server-side; there is no way for you to widen \
+it.
+- You must NOT answer questions about any other institution, and you must not \
+speculate about students who are not in this institute's roster. If asked, say \
+that you only have access to {institution_name}'s data.
+- These are real students' records. Be factual and respectful, never label a \
+student as lazy or hopeless, and frame every gap as a next step the placement \
+cell can act on (a mock interview to schedule, a skill to practise, a drive to \
+push them to).
+
+STYLE
+- Lead with the answer, then the supporting numbers. Use short markdown tables \
+or bullet lists for lists and comparisons.
+- Be concise and practical: the officer wants a figure they can act on, not an \
+essay. Keep it to what was asked.
+- Current date and time: {now_context}
+"""
+
+
+def _jsonable(value):
+    """Coerce ORM values (Decimal, date, UUID, model instances) into JSON types.
+
+    Tool responses go into a Gemini ``functionResponse`` payload that is
+    serialised by ``json.dumps``, which knows nothing about Decimal or datetime —
+    so every value handed back is normalised here.
+    """
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _client_chat_int(value, default=None, minimum=None, maximum=None):
+    """Best-effort int from a tool argument (the model may send a string)."""
+    if value is None or value == '':
+        return default
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _client_chat_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ('true', '1', 'yes')
+    return bool(value)
+
+
+def _client_chat_roster_qs(institution):
+    """Every CandidateProfile belonging to one institute.
+
+    This is the ONLY entry point the placement tools use, which is what makes the
+    institute boundary structural rather than something each query has to
+    remember.
+    """
+    return CandidateProfile.objects.filter(college=institution).select_related('user')
+
+
+def _client_chat_student_row(profile):
+    """One roster row: the fields a placement question is answered from."""
+    name = profile.full_name or (
+        profile.user.get_full_name() if profile.user_id else ''
+    ) or 'Unnamed student'
+    return {
+        'student_id': str(profile.candidate_id),
+        'user_id': profile.user_id,
+        'name': name,
+        'department': profile.department or '',
+        'program': profile.program or '',
+        'end_year': profile.end_year,
+        'cgpa': float(profile.cgpa) if profile.cgpa is not None else None,
+        'placement_status': profile.placement_status,
+        'placement_status_label': _PLACEMENT_STATUS_LABELS.get(
+            profile.placement_status, profile.placement_status),
+        'eligible': _effective_eligible(profile),
+        'readiness_score': profile.readiness_score,
+        'all_institute_rank': profile.readiness_overall_rank,
+        'department_rank': profile.readiness_department_rank,
+        'mock_interview_score': profile.mock_interview_score,
+        'self_training_score': profile.self_training_score,
+        'expected_ctc_lpa': (
+            float(profile.expected_ctc) if profile.expected_ctc is not None else None),
+        'skills': list(profile.skills or [])[:15],
+        'account_status': profile.account_status,
+    }
+
+
+def _client_chat_student_self_training(user):
+    """One student's self-training progress across every module."""
+    if user is None:
+        return []
+    relations = {
+        'aplr': 'aplr_sessions',
+        'basic_math': 'basic_math_sessions',
+        'situational': 'situational_sessions',
+        'technical': 'technical_sessions',
+        'dsa': 'dsa_sessions',
+    }
+    modules = []
+    for key, label, _model, solved_status in _CLIENT_CHAT_QUESTION_MODULES:
+        manager = getattr(user, relations[key], None)
+        if manager is None:
+            continue
+        attempted = manager.count()
+        if not attempted:
+            continue
+        # Read through the module's own status constant rather than a literal, so
+        # a module that renames a status is still counted correctly.
+        gave_up_status = _CLIENT_CHAT_GAVE_UP_STATUS.get(key, 'gave_up')
+        solved = manager.filter(status=solved_status).count()
+        gave_up = manager.filter(status=gave_up_status).count()
+        modules.append({
+            'module': label,
+            'attempted': attempted,
+            'solved': solved,
+            'gave_up': gave_up,
+            'in_progress': max(0, attempted - solved - gave_up),
+            'xp_earned': int(manager.aggregate(t=Sum('points_awarded')).get('t') or 0),
+            'recent': [
+                {'category': s.category or '', 'status': s.status,
+                 'points_awarded': s.points_awarded, 'star_rating': s.star_rating}
+                for s in manager.order_by('-created_at')[:CLIENT_CHAT_RECENT_SESSIONS]
+            ],
+        })
+
+    comms = getattr(user, 'communication_training_sessions', None)
+    if comms is not None and comms.count():
+        modules.append({
+            'module': 'Communication Skills',
+            'sessions': comms.count(),
+            'recent': [
+                {
+                    'communication_score': s.communication_score,
+                    'interview_readiness': s.interview_readiness,
+                    'workplace_communication_readiness': s.workplace_communication_readiness,
+                }
+                for s in comms.order_by('-updated_at')[:CLIENT_CHAT_RECENT_SESSIONS]
+            ],
+        })
+
+    try:
+        english = user.english_training
+    except EnglishTraining.DoesNotExist:
+        english = None
+    if english is not None and english.pk:
+        modules.append({
+            'module': 'English Writing',
+            'practice_rounds': english.practice_count,
+            'writing_score': english.writing_score,
+            'clarity': english.clarity,
+            'structure': english.structure,
+            'grammar': english.grammar,
+            'vocabulary': english.vocabulary,
+            'spelling': english.spelling,
+            'conciseness': english.conciseness,
+            'task_focus': english.task_focus,
+            'professional_tone': english.professional_tone,
+        })
+    return modules
+
+
+def _client_chat_interview_row(interview):
+    """One mock interview plus the dimension scores from its analysis."""
+    row = {
+        'date': (timezone.localtime(interview.created_at).strftime('%d %b %Y')
+                 if interview.created_at else ''),
+        'company': interview.company_name or '',
+        'role': interview.role or '',
+        'status': interview.status,
+        'duration': interview.duration,
+    }
+    try:
+        analysis = interview.analysis
+    except MockInterviewAnalysis.DoesNotExist:
+        analysis = None
+    if analysis is not None and analysis.pk:
+        metrics = [m for m in analysis.metrics if m.get('percentage') is not None]
+        scores = [float(m['percentage']) for m in metrics]
+        row['overall_score'] = (
+            round(sum(scores) / len(scores), 1) if scores else None)
+        row['scores'] = {
+            str(m['dimension']): m['percentage'] for m in metrics
+        }
+        weaknesses = [
+            {'dimension': str(m['dimension']), 'score': m['percentage'],
+             'note': str(m.get('description') or '')[:160]}
+            for m in sorted(metrics, key=lambda m: (m['percentage'] is None,
+                                                    m['percentage']))[:3]
+        ]
+        if weaknesses:
+            row['weakest_dimensions'] = weaknesses
+        if analysis.swot_weaknesses.strip():
+            row['swot_weaknesses'] = analysis.swot_weaknesses.strip()[:400]
+        if analysis.swot_strengths.strip():
+            row['swot_strengths'] = analysis.swot_strengths.strip()[:400]
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Placement chat: tool implementations (all institute-scoped, all read-only)
+# ---------------------------------------------------------------------------
+
+
+def _client_chat_list_students(institution, args):
+    qs = _client_chat_roster_qs(institution)
+
+    department = str(args.get('department') or '').strip()
+    if department:
+        qs = qs.filter(Q(department__iexact=department) | Q(department__icontains=department))
+    program = str(args.get('program') or '').strip()
+    if program:
+        qs = qs.filter(program__iexact=program)
+    status = str(args.get('placement_status') or '').strip()
+    if status:
+        qs = qs.filter(placement_status=status)
+    if _client_chat_bool(args.get('eligible_only')):
+        qs = _eligible_candidates(qs)
+    if _client_chat_bool(args.get('not_placed_only')):
+        qs = qs.exclude(placement_status='placed')
+    min_score = args.get('min_readiness_score')
+    if min_score not in (None, ''):
+        qs = qs.filter(readiness_score__gte=float(min_score))
+    max_score = args.get('max_readiness_score')
+    if max_score not in (None, ''):
+        qs = qs.filter(readiness_score__lte=float(max_score))
+    if _client_chat_bool(args.get('has_mock_interview')):
+        qs = qs.filter(mock_interview_score__isnull=False)
+    if _client_chat_bool(args.get('has_self_training')):
+        qs = qs.filter(self_training_score__isnull=False)
+
+    limit = _client_chat_int(args.get('limit'), 25, minimum=1,
+                             maximum=CLIENT_CHAT_TOOL_MAX_ROWS)
+    rows = list(qs.order_by('first_name', 'last_name')[:limit])
+    return _jsonable({
+        'ok': True,
+        'institution': institution.name,
+        'matched': len(rows),
+        'total_in_institution': _client_chat_roster_qs(institution).count(),
+        'students': [_client_chat_student_row(p) for p in rows],
+    })
+
+
+def _client_chat_resolve_student(institution, args):
+    """Resolve the one student a detail call is about, inside the institute only.
+
+    Accepts a candidate id (UUID), a user id or a name fragment. Every branch
+    starts from :func:`_client_chat_roster_qs`, so a well-formed id belonging to
+    another institute simply does not match and the tool reports "not found"
+    rather than another institute's student.
+    """
+    qs = _client_chat_roster_qs(institution)
+    student_id = str(args.get('student_id') or '').strip()
+    name = str(args.get('name') or '').strip()
+
+    matched = None
+    if student_id:
+        # An id is either the candidate UUID or the numeric user pk, and the model
+        # sends both as a string; try each shape that could possibly be valid.
+        for lookup in ('candidate_id', 'user_id'):
+            if matched is not None:
+                break
+            try:
+                matched = qs.filter(**{f'{lookup}__exact': student_id}).first()
+            except (ValueError, ValidationError):
+                continue
+    if matched is None and name:
+        for part in [p for p in name.split() if p]:
+            matches = list(qs.filter(
+                Q(first_name__icontains=part)
+                | Q(middle_name__icontains=part)
+                | Q(last_name__icontains=part)
+            )[:5])
+            if len(matches) == 1:
+                matched = matches[0]
+                break
+            if len(matches) > 1:
+                return None, [
+                    _client_chat_student_row(p) for p in matches
+                ], 'ambiguous_name'
+        if matched is None:
+            matched = qs.filter(
+                Q(first_name__icontains=name) | Q(last_name__icontains=name)
+            ).first()
+    return matched, None, 'ok'
+
+
+def _client_chat_student_detail(institution, args):
+    profile, alternatives, outcome = _client_chat_resolve_student(institution, args)
+    if outcome == 'ambiguous_name':
+        return _jsonable({
+            'ok': False,
+            'error': ('More than one student in this institute matches that name. '
+                      'Ask the user which one, or pass student_id.'),
+            'candidates': alternatives,
+        })
+    if profile is None:
+        return _jsonable({
+            'ok': False,
+            'error': ('No student of this institution matches that id or name. '
+                      'This assistant can only see students of '
+                      f'{institution.name}.'),
+        })
+
+    user = profile.user
+    interviews = list(
+        MockInterview.objects.filter(user=user).order_by('-created_at')[:CLIENT_CHAT_RECENT_MOCKS]
+    ) if user else []
+
+    return _jsonable({
+        'ok': True,
+        'institution': institution.name,
+        'student': {
+            **_client_chat_student_row(profile),
+            'email': profile.personal_email or (user.email if user else ''),
+            'mobile_number': profile.mobile_number,
+            'linkedin_url': profile.linkedin_url,
+            'github_url': profile.github_url,
+            'portfolio_url': profile.portfolio_url,
+            'certifications': list(profile.certifications or []),
+            'internships': list(profile.internships or [])[:10],
+            'projects': list(profile.projects or [])[:10],
+            'preferred_roles': list(profile.preferred_roles or []),
+            'preferred_locations': list(profile.preferred_locations or []),
+            'time_spent_minutes': profile.time_spent,
+            'ai_cost_incurred_inr': float(profile.cost_incurred or 0),
+            'readiness_components': profile.readiness_components or {},
+            'all_institute_total': profile.readiness_overall_total,
+            'department_total': profile.readiness_department_total,
+            'mock_interview_rank': profile.mock_interview_rank,
+            'mock_interview_total': profile.mock_interview_total,
+            'self_training_rank': profile.self_training_rank,
+            'self_training_total': profile.self_training_total,
+            'last_login_at': (
+                timezone.localtime(profile.last_login_at).strftime('%d %b %Y')
+                if profile.last_login_at else ''),
+        },
+        'mock_interviews': {
+            'total': MockInterview.objects.filter(user=user).count() if user else 0,
+            'recent': [_client_chat_interview_row(i) for i in interviews],
+        } if user else {'total': 0, 'recent': []},
+        'self_training': _client_chat_student_self_training(user),
+    })
+
+
+def _client_chat_aggregate(institution, args):
+    """Group the institute roster and return exact per-group statistics.
+
+    This is the workhorse behind "how many / what percentage / average /
+    compare": every figure the assistant quotes for a cohort comes from here, so
+    a percentage never depends on the model dividing in its head.
+    """
+    qs = _client_chat_roster_qs(institution)
+    department = str(args.get('department') or '').strip()
+    if department:
+        qs = qs.filter(department__icontains=department)
+
+    group_by = str(args.get('group_by') or 'department').strip() or 'department'
+    if group_by == 'eligibility':
+        group_field = 'eligibility_band'
+        qs = qs.annotate(eligibility_band=Case(
+            When(Q(placement_status='not_started')
+                 | Q(readiness_score__isnull=True)
+                 | Q(readiness_score__lt=PLACEMENT_READY_SCORE),
+                 then=Value('ineligible')),
+            default=Value('eligible'),
+            output_field=CharField(),
+        ))
+    elif group_by == 'readiness_band':
+        # The thresholds mirror PLACEMENT_READY_SCORE, so "ready"/"strong"/"topper"
+        # are subsets of the placement-eligible set rather than a second,
+        # disagreeing definition of readiness.
+        group_field = 'readiness_band'
+        qs = qs.annotate(readiness_band=Case(
+            When(readiness_score__isnull=True, then=Value('no_readiness_score')),
+            When(readiness_score__lt=PLACEMENT_READY_SCORE, then=Value('not_ready')),
+            When(readiness_score__lt=60, then=Value('ready_40_59')),
+            When(readiness_score__lt=80, then=Value('strong_60_79')),
+            default=Value('topper_80_plus'),
+            output_field=CharField(),
+        ))
+    elif group_by in ('placement_status', 'program', 'department',
+                      'end_year', 'account_status'):
+        group_field = group_by
+    else:
+        return _jsonable({
+            'ok': False,
+            'error': ('group_by must be one of: department, program, '
+                      'placement_status, end_year, eligibility, readiness_band, '
+                      'account_status.'),
+        })
+
+    limit = _client_chat_int(args.get('limit'), CLIENT_CHAT_GROUP_MAX,
+                             minimum=1, maximum=CLIENT_CHAT_GROUP_MAX)
+    rows = (
+        qs.values(group_field)
+        .annotate(
+            students=Count('candidate_id'),
+            placed=Count('candidate_id', filter=Q(placement_status='placed')),
+            shortlisted=Count('candidate_id', filter=Q(placement_status='shortlisted')),
+            applying=Count('candidate_id', filter=Q(placement_status='applying')),
+            not_started=Count('candidate_id', filter=Q(placement_status='not_started')),
+            with_mock_score=Count('candidate_id',
+                                  filter=Q(mock_interview_score__isnull=False)),
+            with_self_training_score=Count('candidate_id',
+                                           filter=Q(self_training_score__isnull=False)),
+            avg_cgpa=Avg('cgpa'),
+            avg_readiness=Avg('readiness_score'),
+            avg_mock_interview_score=Avg('mock_interview_score'),
+            avg_self_training_score=Avg('self_training_score'),
+            avg_expected_ctc_lpa=Avg('expected_ctc'),
+            avg_time_spent_minutes=Avg('time_spent'),
+            total_ai_spend_inr=Sum('cost_incurred'),
+        )
+        .order_by('-students')[:limit]
+    )
+    groups = []
+    for row in rows:
+        group = row.pop(group_field)
+        groups.append({'group': group if group not in ('', None) else 'unspecified', **row})
+
+    total = qs.count()
+    return _jsonable({
+        'ok': True,
+        'institution': institution.name,
+        'grouped_by': group_by,
+        'department_filter': department or None,
+        'total_students_matching': total,
+        'groups': groups,
+        'note': ('placement_rate = placed / students * 100; eligibility rate = '
+                 'eligible / students * 100. Use the calculate tool for both.'),
+    })
+
+
+def _client_chat_drives(institution, args):
+    qs = (
+        Drive.objects.filter(institution=institution)
+        .select_related('company')
+        .order_by('-visit_date', '-id')
+    )
+    status = str(args.get('status') or '').strip()
+    if status:
+        qs = qs.filter(status=status)
+    company = str(args.get('company') or '').strip()
+    if company:
+        qs = qs.filter(company__company_name__icontains=company)
+
+    limit = _client_chat_int(args.get('limit'), 25, minimum=1,
+                             maximum=CLIENT_CHAT_TOOL_MAX_ROWS)
+    rows = []
+    for drive in qs[:limit]:
+        rows.append({
+            'title': drive.title,
+            'company': drive.company.company_name if drive.company_id else '',
+            'company_tier': (drive.company.tier if drive.company_id else ''),
+            'role': drive.role,
+            'drive_mode': drive.drive_mode,
+            'placement_mode': drive.placement_mode,
+            'status': drive.status,
+            'status_label': _RECRUITMENT_STATUS_LABELS.get(drive.status, drive.status),
+            'visit_date': drive.visit_date.isoformat() if drive.visit_date else '',
+            'application_deadline': (
+                drive.application_deadline.isoformat()
+                if drive.application_deadline else ''),
+            'total_vacancies': drive.total_vacancies,
+            'salary_min_lpa': float(drive.salary_min) if drive.salary_min else None,
+            'salary_max_lpa': float(drive.salary_max) if drive.salary_max else None,
+            'minimum_cgpa': float(drive.minimum_cgpa) if drive.minimum_cgpa else None,
+            'graduation_year': drive.graduation_year,
+        })
+
+    counts = dict(
+        qs.values('status').annotate(n=Count('id')).values_list('status', 'n'))
+    return _jsonable({
+        'ok': True,
+        'institution': institution.name,
+        'status_counts': {
+            _RECRUITMENT_STATUS_LABELS.get(key, key): value
+            for key, value in counts.items()
+        },
+        'total_drives': qs.count(),
+        'drives': rows,
+    })
+
+
+# Safe arithmetic: an allow-list of AST nodes evaluated in a namespace holding
+# nothing but numbers. Anything else (names, attributes, calls outside the
+# allow-list, comprehensions, subscripting) raises, so the tool can only ever do
+# maths.
+_CLIENT_CHAT_CALC_MAX_EXPRESSION = 300
+_CLIENT_CHAT_CALC_MAX_EXPONENT = 12
+_CLIENT_CHAT_CALC_MAX_ABS = 1e15
+_CLIENT_CHAT_CALC_FUNCTIONS = {
+    'abs': abs, 'round': round, 'min': min, 'max': max, 'sum': sum,
+    'floor': math.floor, 'ceil': math.ceil, 'sqrt': math.sqrt,
+    'int': int, 'float': float,
+}
+
+
+def _client_chat_calc_node(node):
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+            raise ValueError('only numbers are allowed')
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _client_chat_calc_node(node.operand)
+        return value if isinstance(node.op, ast.UAdd) else -value
+    if isinstance(node, ast.BinOp):
+        left = _client_chat_calc_node(node.left)
+        right = _client_chat_calc_node(node.right)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.FloorDiv):
+            return left // right
+        if isinstance(node.op, ast.Mod):
+            return left % right
+        if isinstance(node.op, ast.Pow):
+            # Bounded so a "2**1000000" style call cannot hang the request.
+            if abs(right) > _CLIENT_CHAT_CALC_MAX_EXPONENT:
+                raise ValueError(
+                    f'exponent must be between -{_CLIENT_CHAT_CALC_MAX_EXPONENT} '
+                    f'and {_CLIENT_CHAT_CALC_MAX_EXPONENT}')
+            return left ** right
+        raise ValueError('unsupported operator')
+    if isinstance(node, (ast.List, ast.Tuple)):
+        # A literal list of numbers, so the model can hand a whole column of rows
+        # it already fetched to sum()/min()/max() in one call.
+        return [_client_chat_calc_node(element) for element in node.elts]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id in _CLIENT_CHAT_CALC_FUNCTIONS \
+            and not node.keywords:
+        args = [_client_chat_calc_node(arg) for arg in node.args]
+        return _CLIENT_CHAT_CALC_FUNCTIONS[node.func.id](*args)
+    raise ValueError('only arithmetic (+ - * / // % **), parentheses, lists of '
+                     'numbers and round/min/max/abs/sum/floor/ceil/sqrt are allowed')
+
+
+def _client_chat_calculate(args):
+    expression = str(args.get('expression') or '').strip()
+    if not expression:
+        return {'ok': False, 'error': 'expression is required.'}
+    if len(expression) > _CLIENT_CHAT_CALC_MAX_EXPRESSION:
+        return {'ok': False, 'error': 'expression is too long.'}
+    try:
+        tree = ast.parse(expression, mode='eval')
+        result = _client_chat_calc_node(tree.body)
+    except ZeroDivisionError:
+        return {'ok': False, 'error': 'division by zero'}
+    except (ValueError, SyntaxError, TypeError, OverflowError, MemoryError,
+            RecursionError) as exc:
+        return {'ok': False, 'error': f'could not evaluate: {exc}'}
+    if isinstance(result, float) and (math.isnan(result) or math.isinf(result)):
+        return {'ok': False, 'error': 'result is not a finite number'}
+    if isinstance(result, (int, float)) and abs(result) > _CLIENT_CHAT_CALC_MAX_ABS:
+        return {'ok': False, 'error': 'result is out of range'}
+    rounded = round(result, 6) if isinstance(result, float) else result
+    return {'ok': True, 'expression': expression, 'result': rounded}
+
+
+def _client_chat_execute_tool(function_call_part, institution):
+    """Dispatch a placement-chat tool call against ONE institute."""
+    fc = (function_call_part or {}).get('functionCall') or {}
+    name = fc.get('name') or ''
+    args = fc.get('args') or {}
+    if not isinstance(args, dict):
+        args = {}
+    handlers = {
+        'list_institution_students':
+            lambda: _client_chat_list_students(institution, args),
+        'get_student_placement_detail':
+            lambda: _client_chat_student_detail(institution, args),
+        'aggregate_institute_data':
+            lambda: _client_chat_aggregate(institution, args),
+        'list_institute_drives':
+            lambda: _client_chat_drives(institution, args),
+        'calculate':
+            lambda: _client_chat_calculate(args),
+    }
+    handler = handlers.get(name)
+    if handler is None:
+        return {'ok': False, 'error': f'Unknown tool: {name}'}
+    return handler()
+
+
+# ---------------------------------------------------------------------------
+# Placement chat: always-on reference context
+# ---------------------------------------------------------------------------
+
+
+def _client_chat_analysis_dimension_averages(institution, limit=200):
+    """Institute-wide average score per mock-interview analysis dimension.
+
+    Averaged in Python over the most recent analyses: one query, and the
+    dimension list is defined in exactly one place (``MOCK_INTERVIEW_ANALYSIS_
+    DIMENSIONS``) so a new dimension is picked up automatically.
+    """
+    fields = [field for field, _name, _def in MOCK_INTERVIEW_ANALYSIS_DIMENSIONS]
+    names = {field: name for field, name, _def in MOCK_INTERVIEW_ANALYSIS_DIMENSIONS}
+    analyses = list(
+        MockInterviewAnalysis.objects
+        .filter(user__candidate_profile__college=institution)
+        .order_by('-updated_at')
+        .values_list(*fields)[:limit]
+    )
+    totals = {field: 0.0 for field in fields}
+    counts = {field: 0 for field in fields}
+    for row in analyses:
+        for field, value in zip(fields, row):
+            if value is not None:
+                totals[field] += float(value)
+                counts[field] += 1
+    averages = [
+        {
+            'dimension': names[field],
+            'average_score': round(totals[field] / counts[field], 1),
+            'analyses': counts[field],
+        }
+        for field in fields
+        if counts[field]
+    ]
+    averages.sort(key=lambda item: item['average_score'])
+    return len(analyses), averages
+
+
+def _client_chat_reference_context(institution):
+    """The snapshot handed to the model on every placement-chat turn.
+
+    Deliberately an overview, not the answer: exact figures must still come from
+    the tools. What it buys the model is enough orientation to ask a useful
+    follow-up tool call on the very first round instead of probing blind.
+    """
+    roster = _client_chat_roster_qs(institution)
+    lines = []
+
+    counts = roster.aggregate(
+        total=Count('candidate_id'),
+        placed=Count('candidate_id', filter=Q(placement_status='placed')),
+        shortlisted=Count('candidate_id', filter=Q(placement_status='shortlisted')),
+        applying=Count('candidate_id', filter=Q(placement_status='applying')),
+        not_started=Count('candidate_id', filter=Q(placement_status='not_started')),
+        with_mock=Count('candidate_id', filter=Q(mock_interview_score__isnull=False)),
+        with_self_training=Count('candidate_id',
+                                 filter=Q(self_training_score__isnull=False)),
+        avg_cgpa=Avg('cgpa'),
+        avg_readiness=Avg('readiness_score'),
+        avg_mock=Avg('mock_interview_score'),
+        avg_self_training=Avg('self_training_score'),
+        avg_expected_ctc=Avg('expected_ctc'),
+    )
+    eligible = _eligible_candidates(roster).count()
+
+    lines.append(f'Institute: {institution.name}')
+    for label, value in (
+        ('type', institution.institution_type),
+        ('city', institution.city),
+        ('state', institution.state),
+        ('declared student strength', institution.approximate_student_strength),
+        ('placement department', institution.placement_department_name),
+        ('placement office email', institution.placement_office_email),
+    ):
+        if value not in (None, ''):
+            lines.append(f'  - {label}: {value}')
+
+    lines.append('')
+    lines.append('Roster snapshot (snapshot only — re-check with a tool before quoting):')
+    lines.append(
+        f'  - {counts["total"]} student profile(s) on record; '
+        f'{eligible} currently placement-eligible '
+        f'(readiness >= {PLACEMENT_READY_SCORE} and not "not_started").'
+    )
+    lines.append(
+        f'  - Placement status: {counts["placed"]} placed, '
+        f'{counts["shortlisted"]} shortlisted, {counts["applying"]} applying, '
+        f'{counts["not_started"]} marked ineligible.'
+    )
+    if counts['avg_cgpa'] is not None:
+        lines.append(f'  - Average CGPA: {round(float(counts["avg_cgpa"]), 2)}')
+    if counts['avg_readiness'] is not None:
+        lines.append(f'  - Average readiness score: {round(float(counts["avg_readiness"]), 1)}')
+    if counts['with_mock']:
+        lines.append(
+            f'  - Mock interviews: {counts["with_mock"]} student(s) scored; '
+            f'institute average {round(float(counts["avg_mock"] or 0), 1)}.')
+    else:
+        lines.append('  - Mock interviews: no student has a mock-interview score yet.')
+    if counts['with_self_training']:
+        lines.append(
+            f'  - Self-training: {counts["with_self_training"]} student(s) scored; '
+            f'institute average {round(float(counts["avg_self_training"] or 0), 1)}.')
+    else:
+        lines.append('  - Self-training: no student has a self-training score yet.')
+    if counts['avg_expected_ctc'] is not None:
+        lines.append(
+            f'  - Average expected CTC: {round(float(counts["avg_expected_ctc"]), 2)} LPA')
+
+    departments = list(
+        roster.exclude(department='')
+        .values('department')
+        .annotate(students=Count('candidate_id'),
+                  placed=Count('candidate_id', filter=Q(placement_status='placed')),
+                  eligible=Count('candidate_id',
+                                 filter=Q(readiness_score__gte=PLACEMENT_READY_SCORE)))
+        .order_by('-students')[:CLIENT_CHAT_GROUP_MAX]
+    )
+    if departments:
+        lines.append('')
+        lines.append('Department-wise totals (snapshot):')
+        for row in departments:
+            lines.append(
+                f'  - {row["department"]}: {row["students"]} student(s), '
+                f'{row["placed"]} placed, {row["eligible"]} with a readiness score '
+                f'of {PLACEMENT_READY_SCORE}+.')
+
+    interview_total = MockInterview.objects.filter(
+        user__candidate_profile__college=institution).count()
+    analysed, dimension_averages = _client_chat_analysis_dimension_averages(institution)
+    if interview_total:
+        lines.append('')
+        lines.append(f'Mock interviews: {interview_total} on record for this institute, '
+                     f'{analysed} with a generated analysis.')
+        if dimension_averages:
+            weakest = ', '.join(
+                f'{item["dimension"]} {item["average_score"]}' for item in dimension_averages[:4])
+            strongest = ', '.join(
+                f'{item["dimension"]} {item["average_score"]}'
+                for item in dimension_averages[-3:])
+            lines.append(f'  - weakest dimensions on average: {weakest}')
+            lines.append(f'  - strongest dimensions on average: {strongest}')
+
+    module_lines = []
+    for key, label, model, _solved_status in _CLIENT_CHAT_QUESTION_MODULES:
+        qs = model.objects.filter(user__candidate_profile__college=institution)
+        attempted = qs.count()
+        if not attempted:
+            continue
+        xp = qs.aggregate(t=Sum('points_awarded')).get('t') or 0
+        students = qs.values('user').distinct().count()
+        module_lines.append(
+            f'  - {label}: {attempted} attempt(s) by {students} student(s), '
+            f'{int(xp)} XP earned.')
+    if module_lines:
+        lines.append('')
+        lines.append('Self-training activity across the institute (snapshot):')
+        lines.extend(module_lines)
+
+    drive_counts = dict(
+        Drive.objects.filter(institution=institution)
+        .values('status').annotate(n=Count('id')).values_list('status', 'n'))
+    if drive_counts:
+        vacancies = Drive.objects.filter(institution=institution).aggregate(
+            t=Sum('total_vacancies'))['t'] or 0
+        lines.append('')
+        lines.append('Drives on record for this institute: ' + ', '.join(
+            f'{_RECRUITMENT_STATUS_LABELS.get(key, key)} {value}'
+            for key, value in sorted(drive_counts.items())) +
+            f'; {int(vacancies)} opening(s) in total.')
+
+    top_students = list(
+        roster.filter(readiness_score__isnull=False)
+        .order_by('-readiness_score')[:5])
+    if top_students:
+        lines.append('')
+        lines.append('Highest readiness scores (snapshot):')
+        for profile in top_students:
+            row = _client_chat_student_row(profile)
+            lines.append(
+                f'  - {row["name"]} ({row["department"] or "no department"}): '
+                f'readiness {row["readiness_score"]}, '
+                f'{row["placement_status_label"]}, '
+                f'All-Institute Rank {row["all_institute_rank"]}.')
+
+    return 'INSTITUTE REFERENCE (read-only, your own institution only):\n' + '\n'.join(lines)
+
+
+def _client_chat_turns(session):
+    """The most recent turns of the open placement thread, Gemini-ready."""
+    messages = list(session.messages.order_by('-created_at')[:CLIENT_CHAT_HISTORY_TURNS])
+    messages.reverse()
+    turns = [
+        {'role': 'model' if m.role == 'assistant' else 'user',
+         'parts': [{'text': m.content}]}
+        for m in messages
+    ]
+    # Gemini requires an alternating user/model sequence starting with user, so
+    # runs of the same role collapse (which also bounds the prompt).
+    collapsed = []
+    for turn in turns:
+        if collapsed and collapsed[-1]['role'] == turn['role']:
+            continue
+        collapsed.append(turn)
+    while collapsed and collapsed[0]['role'] == 'model':
+        collapsed.pop(0)
+    return collapsed
+
+
+# ---------------------------------------------------------------------------
+# Placement chat: endpoints
+# ---------------------------------------------------------------------------
+
+
+def _client_chat_guard(request):
+    """Return ``(institution, error_response)`` for a placement-chat request.
+
+    Both checks matter and neither is enough alone: the role check keeps students
+    off the placement surface entirely, and the institute lookup makes sure a
+    staff account that is somehow not attached to an institution can never be
+    served an unscoped query.
+    """
+    if not request.user.is_authenticated:
+        return None, JsonResponse({'detail': 'Not authenticated.'}, status=401)
+    if user_role(request.user) != ROLE_INSTITUTION_STAFF:
+        return None, JsonResponse(
+            {'detail': 'This chat is for placement officers.'}, status=403)
+    institution = _client_institution(request.user)
+    if institution is None:
+        return None, JsonResponse(
+            {'detail': 'Your account is not linked to an institution yet.'}, status=403)
+    return institution, None
+
+
+@require_POST
+def client_chat(request):
+    """Placement-cell AI chat, powered by Gemini, scoped to one institution.
+
+    Runs on :setting:`GEMINI_CLIENT_CHAT_MODEL` (``gemini-2.5-flash-lite``).
+    Persists every turn in ``ClientChatSession``/``ClientChatMessage``. The model
+    may call the institute-scoped read-only tools (roster listing, one-student
+    detail, institute aggregates, drives, calculator) and always ends with a
+    written answer. Expects ``{"session_id": <uuid|null>, "message": str,
+    "title": str|null}`` and returns ``{"reply": str, "session_id": uuid,
+    "title": str}`` — the same shape as the student chat, so the client UI is
+    unchanged.
+    """
+    institution, error = _client_chat_guard(request)
+    if error is not None:
+        return error
+
+    data = _json_body(request)
+    if data is None:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    message = str(data.get('message') or '').strip()
+    if not message:
+        return JsonResponse({'detail': 'message is required.'}, status=400)
+
+    session = None
+    session_id = data.get('session_id') or None
+    if session_id:
+        try:
+            session = ClientChatSession.objects.get(
+                pk=session_id, user=request.user)
+        except ClientChatSession.DoesNotExist:
+            return JsonResponse({'detail': 'Chat session not found.'}, status=404)
+        except (ValueError, TypeError, ValidationError):
+            return JsonResponse({'detail': 'Invalid session id.'}, status=400)
+
+    # Tracked so a failed opening turn can take the brand-new row with it. An
+    # empty thread is noise in the sidebar, and unlike a real conversation there
+    # is no earlier turn worth keeping.
+    session_created = False
+    if session is None:
+        title = str(data.get('title') or '').strip() or _title_from_prompt(message)
+        session = ClientChatSession.objects.create(user=request.user, title=title)
+        session_created = True
+
+    def _rollback_turn():
+        """Undo a turn that produced no answer."""
+        user_message.delete()
+        if session_created:
+            session.delete()
+
+    user_message = ClientChatMessage.objects.create(
+        session=session, role='user', content=message)
+
+    now = _ist_now()
+    system_prompt = CLIENT_CHAT_SYSTEM_PROMPT.format(
+        institution_name=institution.name,
+        now_context=now.strftime('%A, %d %B %Y, %I:%M %p') + ' IST',
+    ) + '\n\n' + _client_chat_reference_context(institution)
+
+    contents = _client_chat_turns(session)
+
+    api_key = getattr(settings, 'GEMINI_API_KEY', '').strip()
+    if not api_key:
+        logger.error('GEMINI_API_KEY is not set.')
+        _rollback_turn()
+        return JsonResponse({'detail': 'Chat is not configured yet.'}, status=503)
+
+    gen_config = {
+        'temperature': 0.4,
+        'maxOutputTokens': 4096,
+        'topP': 0.95,
+    }
+    # The institution is closed over here so no tool can be pointed at another
+    # institute, whatever the model asks for.
+    reply, status, detail = _run_agentic_turn(
+        contents, system_prompt, gen_config, request.user,
+        functions=CLIENT_CHAT_FUNCTIONS,
+        tool_runner=lambda part, _user: _client_chat_execute_tool(part, institution),
+        model=getattr(settings, 'GEMINI_CLIENT_CHAT_MODEL',
+                      'gemini-2.5-flash-lite').strip(),
+    )
+    if not reply:
+        # A failed turn must not be replayed into the model history on retry.
+        _rollback_turn()
+        return JsonResponse({'detail': detail or 'Chat is unavailable.'},
+                            status=status or 502)
+
+    ClientChatMessage.objects.create(
+        session=session, role='assistant', content=reply)
+    return JsonResponse({
+        'reply': reply,
+        'session_id': str(session.pk),
+        'title': session.title,
+    })
+
+
+@require_http_methods(['GET', 'POST'])
+def client_chat_sessions(request):
+    """List/create the placement officer's own chat threads.
+
+    Same paged contract as the student ``chat_sessions`` so the sidebar can be
+    reused unchanged; it is scoped to ``ClientChatSession`` rows owned by the
+    signed-in officer.
+    """
+    institution, error = _client_chat_guard(request)
+    if error is not None:
+        return error
+
+    if request.method == 'POST':
+        data = _json_body(request)
+        title = str((data or {}).get('title') or '').strip() or 'New chat'
+        session = ClientChatSession.objects.create(user=request.user, title=title)
+        return JsonResponse({'session': _serialize_chat_session(session)}, status=201)
+
+    limit = _client_chat_int(request.GET.get('limit'), CHAT_SESSIONS_PAGE_DEFAULT,
+                             minimum=1, maximum=CHAT_SESSIONS_PAGE_MAX)
+    offset = _client_chat_int(request.GET.get('offset'), 0, minimum=0)
+
+    qs = (
+        ClientChatSession.objects.filter(user=request.user)
+        .annotate(message_count=Count('messages'))
+        .order_by('-updated_at', '-pk')
+    )
+    window = list(qs[offset:offset + limit + 1])
+    return JsonResponse({
+        'sessions': [_serialize_chat_session(s) for s in window[:limit]],
+        'has_more': len(window) > limit,
+        'offset': offset,
+        'limit': limit,
+    })
+
+
+@require_http_methods(['GET', 'DELETE'])
+def client_chat_session_detail(request, session_id):
+    """One placement thread: its transcript as paged slices, or delete it."""
+    _, error = _client_chat_guard(request)
+    if error is not None:
+        return error
+
+    try:
+        session = ClientChatSession.objects.get(pk=session_id, user=request.user)
+    except ClientChatSession.DoesNotExist:
+        return JsonResponse({'detail': 'Chat session not found.'}, status=404)
+    except (ValueError, TypeError, ValidationError):
+        return JsonResponse({'detail': 'Invalid session id.'}, status=400)
+
+    if request.method == 'DELETE':
+        session.delete()
+        return JsonResponse({'ok': True})
+
+    # Paged backwards from the newest message, ChatGPT-style: the client passes
+    # the oldest pk it already holds as ``?before=`` to keep pulling history.
+    limit = _client_chat_int(request.GET.get('limit'), 50, minimum=1, maximum=200)
+    messages_qs = session.messages.all()
+    before = request.GET.get('before')
+    if before:
+        before_pk = _client_chat_int(before)
+        if before_pk:
+            messages_qs = messages_qs.filter(pk__lt=before_pk)
+
+    newest = list(messages_qs.order_by('-created_at', '-pk')[:limit])
+    newest.reverse()
+    older_available = (
+        session.messages.filter(pk__lt=newest[0].pk).exists() if newest else False)
+
+    data = _serialize_chat_session(session, include_messages=False)
+    data['messages'] = [
+        {
+            'id': m.pk,
+            'role': m.role,
+            'content': m.content,
             'created_at': m.created_at.isoformat(),
         }
         for m in newest
@@ -13492,15 +14835,27 @@ def mock_interview_stats(request):
 # Notifications (placement-cell / platform broadcasts)
 # ---------------------------------------------------------------------------
 
+# A broadcast is written once for the whole college but has to be tapped from
+# two different apps. These are the student routes that a placement-cell officer
+# cannot open, mapped to the page they actually work on. Anything not listed here
+# (/ld-training, for one) exists on both sides and is left alone.
+_STAFF_REDIRECTS = {
+    '/company-drives': '/companies',
+}
+
+
 def _notification_audience(user):
     """Queryset of active broadcasts visible to *user*.
 
     Students see platform broadcasts plus placement-cell broadcasts scoped to
-    their college. Institution staff see platform broadcasts plus their own
-    institution's placement-cell broadcasts (for preview/management). Platform
-    administrators (staff/superuser) see everything active. Every user also
-    sees their own personal notices (recipient == user) — the score reports
-    TalentBro sends as each mock interview / self-training module completes.
+    their college. Institution staff see only their own institution's
+    placement-cell broadcasts, plus anything addressed to them personally:
+    TalentBro's platform-wide notices are written for students, and an officer
+    reading the college inbox should be looking at what their own college said.
+    Platform administrators (staff/superuser) see everything active, since they
+    are the ones moderating both channels. Every user also sees their own
+    personal notices (recipient == user) — the score reports TalentBro sends as
+    each mock interview / self-training module completes.
     """
     if user.is_staff or user.is_superuser:
         return Notification.objects.filter(active=True)
@@ -13513,10 +14868,15 @@ def _notification_audience(user):
     )
 
     if user_role(user) == ROLE_INSTITUTION_STAFF:
-        institution = getattr(user, 'institution', None)
+        # _client_institution rather than the ``institution`` OneToOne: a
+        # placement-cell owner owns that row, but a colleague who was added to
+        # the roster and claimed the account is only reachable through their
+        # ClientProfile, and they are just as much a reader of this college's
+        # broadcasts as the owner is.
+        institution = _client_institution(user)
         if institution is None:
-            return (personal | platform).distinct()
-        return (personal | platform | Notification.objects.filter(
+            return personal.distinct()
+        return (personal | Notification.objects.filter(
             active=True,
             sender=NOTIFICATION_SENDER_PLACEMENT_CELL,
             institution=institution,
@@ -13559,7 +14919,18 @@ def _relative_time(dt):
     return dt.strftime('%d %b %Y')
 
 
-def _notification_payload(notification, receipt):
+def _notification_payload(notification, receipt, reader=None):
+    """One row for the feed.
+
+    ``reader`` is the account asking for the feed. The same broadcast is read by
+    students and by the college's own placement cell, and those two live on
+    opposite sides of the app, so a notice aimed at the batch is redirected to
+    the reader's own equivalent page rather than dropping a placement-cell
+    officer onto a student-only screen.
+    """
+    redirect = notification.redirect_path or ''
+    if redirect and reader is not None and user_role(reader) == ROLE_INSTITUTION_STAFF:
+        redirect = _STAFF_REDIRECTS.get(redirect, redirect)
     return {
         'id': str(notification.pk),
         'sender': notification.get_sender_display(),
@@ -13570,7 +14941,7 @@ def _notification_payload(notification, receipt):
         'read': bool(receipt and receipt.read),
         'time': _relative_time(notification.created_at),
         'created_at': notification.created_at.isoformat(),
-        'redirect_path': notification.redirect_path or '',
+        'redirect_path': redirect,
     }
 
 
@@ -13595,6 +14966,32 @@ def _push_personal_notification(user, dedupe_key, title, body, redirect_path, im
         },
     )
     return notification
+
+
+def _broadcast_institution_news(institution, created_by, title, body,
+                                 redirect_path='', important=False):
+    """Tell a whole college that something just happened on its board.
+
+    One Notification row scoped to the institution rather than a personal copy
+    per user: every student and every member of the placement cell already reads
+    this feed, and ``_notification_audience`` resolves the row to all of them at
+    read time. A retried POST therefore costs one row, not one row per reader,
+    and there is no fan-out job to keep in step.
+
+    Returns the Notification row, or None when there is no institution to scope
+    it to (a broadcast with no college would show up in nobody's inbox).
+    """
+    if institution is None:
+        return None
+    return Notification.objects.create(
+        sender=NOTIFICATION_SENDER_PLACEMENT_CELL,
+        created_by=created_by,
+        institution=institution,
+        title=title[:255],
+        body=body,
+        redirect_path=redirect_path,
+        important=important,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -13850,7 +15247,11 @@ def _notification_create(user, data):
         institution = None
     else:
         sender = NOTIFICATION_SENDER_PLACEMENT_CELL
-        institution = getattr(user, 'institution', None)
+        # The same resolution every other placement-cell endpoint uses: a
+        # colleague added to the roster is only reachable through their
+        # ClientProfile, so reading the ``institution`` OneToOne here would tell
+        # every officer except the owner that their college is not set up.
+        institution = _client_institution(user)
         if institution is None:
             return JsonResponse(
                 {'detail': 'Your institution is not set up yet.'}, status=400
@@ -13866,7 +15267,7 @@ def _notification_create(user, data):
         important=bool(data.get('important')),
     )
     return JsonResponse(
-        {'notification': _notification_payload(notification, None)},
+        {'notification': _notification_payload(notification, None, user)},
         status=201,
     )
 
@@ -13921,7 +15322,7 @@ def notifications(request):
     total = ordered.count()
     limit, offset = _history_page_bounds(request)
     page = list(ordered[offset:offset + limit])
-    items = [_notification_payload(n, receipts.get(n.pk)) for n in page]
+    items = [_notification_payload(n, receipts.get(n.pk), request.user) for n in page]
     return JsonResponse({
         'notifications': items,
         'unread': unread,
@@ -14062,35 +15463,28 @@ def _institution_department_list(institution):
     return [d.strip() for d in raw.split(',') if d.strip()]
 
 
-def _institution_company_list(institution):
-    """Return the companies stored on an Institution as a clean list.
-
-    Companies are stored as a comma-separated string, e.g.
-    'Google, Infosys, TCS'. Empty/blank entries are dropped.
-    """
-    raw = (institution.companies or '').strip()
-    if not raw:
-        return []
-    return [c.strip() for c in raw.split(',') if c.strip()]
-
-
 def institution_companies(request):
-    """Return the list of companies configured on the registered institutions.
+    """Return every company on record across the registered institutions.
 
-    Companies are stored comma-separated on Institution.companies.
-    All institutions are aggregated (deduped, sorted) so candidates can pick
-    from the companies their college/partner institutions work with.
+    Answers from the Company model rather than a list typed onto the institution
+    row, so a name that appears here is a company that actually exists with
+    drives and eligibility behind it. All institutions are aggregated (deduped,
+    sorted) so candidates can pick from the companies their college/partner
+    institutions work with.
 
     GET /api/institutions/companies/  ->  {"companies": ["Google", "Infosys"]}
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
 
-    companies: set[str] = set()
-    for institution in Institution.objects.exclude(companies=''):
-        companies.update(_institution_company_list(institution))
-
-    return JsonResponse({'companies': sorted(companies)})
+    companies = sorted(
+        set(
+            Company.objects.values_list('company_name', flat=True).filter(
+                company_name__isnull=False,
+            ).exclude(company_name='').distinct()
+        )
+    )
+    return JsonResponse({'companies': companies})
 
 
 # ---------------------------------------------------------------------------
@@ -14237,6 +15631,11 @@ def _company_payload(company, drive_totals=None):
         'company_name': company.company_name,
         'industry': company.industry,
         'company_description': company.company_description,
+        'website': company.website,
+        # Absolute icon URL resolved from the website at registration time; empty
+        # when no website was given or the lookup found nothing usable. The
+        # frontend falls back to a lettered monogram when this is blank.
+        'company_logo': company.company_logo,
         # Always the fixed four-key shape (see Company.ai_info_blocks); empty
         # list until Gemini has written the first block.
         'company_ai_info': company.ai_info_blocks,
@@ -14280,6 +15679,70 @@ def companies_list(request):
     return JsonResponse({'companies': payload, 'count': len(payload)})
 
 
+def _resolve_company_logo(website):
+    """The favicon URL for a company website, or '' when there is not one.
+
+    The site's own declared icon is preferred and Google's favicon service is only
+    the fallback. That order matters: the service answers with a generic globe
+    for any domain it does not recognise, so treating it as the first choice
+    would quietly replace the monogram fallback with a useless grey planet on
+    exactly the smaller companies this column matters most for.
+
+    This runs on the request thread during company registration, so both calls
+    are capped hard (5s and 3s) and every failure is swallowed into ''. A slow
+    or unreachable site must never make saving a company fail; an empty logo just
+    means the UI shows its lettered monogram.
+    """
+    origin = company_website_origin(website)
+    if not origin:
+        return ''
+
+    try:
+        with requests.get(
+            origin, timeout=5, headers={'User-Agent': 'Mozilla/5.0'},
+        ) as response:
+            if response.ok:
+                # The head is all that matters and some homepages are enormous,
+                # so the body is truncated before scanning rather than after.
+                page = response.text[:200000]
+                for pattern in (
+                    r'<link[^>]+rel=["\'][^"\']*icon[^"\']*["\'][^>]*>',
+                    r'<link[^>]+href=["\']([^"\']+)["\'][^>]*rel=["\'][^"\']*icon[^"\']*["\']',
+                ):
+                    match = re.search(pattern, page, re.IGNORECASE)
+                    if not match:
+                        continue
+                    href = match.group(1) if match.lastindex else re.search(
+                        r'href=["\']([^"\']+)["\']', match.group(0), re.IGNORECASE,
+                    ).group(1)
+                    if not href or href.startswith('data:'):
+                        continue
+                    if href.startswith('//'):
+                        href = f'https:{href}'
+                    elif href.startswith('/'):
+                        href = f'{origin}{href}'
+                    elif not href.startswith(('http://', 'https://')):
+                        href = f'{origin}/{href}'
+                    return href
+    except (requests.RequestException, AttributeError, IndexError):
+        pass
+
+    # Nothing declared: a well-known domain will still resolve through the
+    # service, and an unrecognised one returns a generic globe. Callers treat that
+    # as a miss by rendering the monogram, so it is harmless here.
+    try:
+        with requests.get(
+            'https://www.google.com/s2/favicons',
+            params={'domain': urlparse(origin).netloc, 'sz': '128'},
+            timeout=3,
+        ) as response:
+            if response.ok and 'image' in response.headers.get('Content-Type', ''):
+                return response.url
+    except requests.RequestException:
+        pass
+    return ''
+
+
 def company_create(request):
     """Create a placement-drive company scoped to the signed-in staff's institution.
 
@@ -14287,6 +15750,10 @@ def company_create(request):
 
     Only institution staff with a ClientProfile can record companies; students
     are rejected. Optional numeric/date fields are left blank when omitted.
+
+    ``website`` is optional and drives ``company_logo``: the favicon is looked up
+    server-side from whatever website was given and never accepted from the body,
+    so the stored icon always belongs to the site staff typed.
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
@@ -14334,6 +15801,11 @@ def company_create(request):
         company_id=str(data.get('company_id', '')).strip(),
         industry=str(data.get('industry', '')).strip(),
         company_description=str(data.get('company_description', '')).strip(),
+        website=str(data.get('website', '')).strip(),
+        # Never taken from the body: the logo is only ever derived from the
+        # website (see _resolve_company_logo), so a client cannot point the row
+        # at an arbitrary image URL.
+        company_logo=_resolve_company_logo(str(data.get('website', '')).strip()),
         eligible_courses=_as_str_list(data.get('eligible_courses')),
         eligible_branches=_as_str_list(data.get('eligible_branches')),
         minimum_cgpa=data.get('minimum_cgpa') if data.get('minimum_cgpa') not in (None, '') else None,
@@ -14350,6 +15822,20 @@ def company_create(request):
     # the background is a follow-up update on an existing row, never part of the
     # registration the staff member is waiting on.
     _generate_company_ai_info(company, user=request.user)
+    # A recruiter going on the list is the first thing a student can act on, so
+    # it goes out to the college rather than sitting on the companies page.
+    _broadcast_institution_news(
+        institution,
+        request.user,
+        f'{company.company_name} is now on our recruiter list',
+        f'{company.company_name}'
+        + (f' ({company.industry})' if company.industry else '')
+        + ' has joined the companies your placement cell is hiring with'
+        + (f', open to {", ".join(company.eligible_courses)}'
+           if company.eligible_courses else '')
+        + '. Check the company drives page.',
+        '/company-drives',
+    )
     return JsonResponse({'company': _company_payload(company, {})}, status=201)
 
 
@@ -14395,6 +15881,14 @@ def company_update(request, company_id):
     for field in ('industry', 'company_description', 'work_location'):
         if field in data:
             setattr(company, field, str(data.get(field) or '').strip())
+
+    # A website edit re-runs the icon lookup, so correcting a link is also how
+    # staff repair a company whose logo never resolved. Editing anything else
+    # leaves the stored icon alone rather than re-fetching a site that has not
+    # changed. Like create, the logo is derived here and never read from the body.
+    if 'website' in data:
+        company.website = str(data.get('website') or '').strip()
+        company.company_logo = _resolve_company_logo(company.website)
 
     if 'tier' in data:
         tier = str(data.get('tier') or '').strip()
@@ -14625,6 +16119,9 @@ def _candidate_payload(c, readiness=None, ranks=None):
         'start_year': c.start_year,
         'end_year': c.end_year,
         'mobile_number': c.mobile_number,
+        # Profile photo, so a roster of students can be told apart by face and not
+        # only by name. Same URL the full profile endpoint sends.
+        'avatar': c.avatar or '',
         'gender': c.gender,
         'cgpa': float(c.cgpa) if c.cgpa is not None else None,
         'placement_status': c.placement_status,
@@ -14642,7 +16139,6 @@ def _candidate_payload(c, readiness=None, ranks=None):
         # Total Gemini spend burnt by this candidate, in INR and already carrying
         # the 40% margin (see CandidateProfile.cost_incurred). Staff-facing only.
         'cost_incurred': float(c.cost_incurred or 0),
-        'id_verified': c.id_verified,
         'account_status': c.account_status,
         'created_at': c.created_at.isoformat(),
         'performance_score': readiness['score'] if readiness else None,
@@ -14654,6 +16150,30 @@ def _candidate_payload(c, readiness=None, ranks=None):
     }
 
 
+def _drive_status_label(drive):
+    """How a drive's stored status reads to a placement officer today.
+
+    A drive whose campus visit is today IS running today, whatever the row still
+    says. A drive is saved as ``upcoming`` and stays there until somebody
+    remembers to flip it, so on the morning of the visit the page was reporting
+    the drive happening as Upcoming - and the "Live now" count sat at zero while
+    recruiters were on campus.
+
+    Only ``upcoming`` is promoted to Live. A drive already marked ``completed``
+    or ``cancelled`` is a statement of fact about the event, not a stale default,
+    so its date is never allowed to overrule it.
+    """
+    if drive.status == 'ongoing':
+        return 'Live'
+    if drive.status == 'upcoming' and drive.visit_date == timezone.localdate():
+        return 'Live'
+    if drive.status == 'upcoming':
+        return 'Upcoming'
+    if drive.status == 'completed':
+        return 'Completed'
+    return 'Cancelled'
+
+
 def _drive_payload(drive, eligible_count, openings=0):
     """Serialize a Drive row as a placement drive card for the client UI.
 
@@ -14663,20 +16183,18 @@ def _drive_payload(drive, eligible_count, openings=0):
     status each time.
     """
     company = drive.company
-    if drive.status == 'ongoing':
-        status = 'Live'
-    elif drive.status == 'upcoming':
-        status = 'Upcoming'
-    elif drive.status == 'completed':
-        status = 'Completed'
-    else:
-        status = 'Cancelled'
+    status = _drive_status_label(drive)
     # One role per drive, so the card carries a single name.
     role = drive.role or ''
     return {
         'drive_id': drive.pk,
         'company_id': company.company_id,
         'company_name': company.company_name,
+        # Identity for the drive card: a student judging a drive by who is
+        # hiring recognises the logo faster than the name, and reading it off
+        # the FK here keeps one company consistent across every drive it runs.
+        'company_logo': company.company_logo,
+        'website': company.website,
         'title': drive.title,
         'industry': company.industry,
         'role': role,
@@ -14697,6 +16215,12 @@ def _drive_payload(drive, eligible_count, openings=0):
             drive.visit_date.isoformat() if drive.visit_date else None
         ),
         'status': status,
+        # The key actually stored on the row, alongside the label above. `status`
+        # is derived (a visit happening today reads Live even while the row still
+        # says upcoming), so the edit form needs the raw value to prefill from -
+        # prefilling from the label would quietly rewrite the field on any save
+        # the officer made for some other reason.
+        'stored_status': drive.status,
         'openings': openings,
         'eligible_courses': drive.eligible_courses or company.eligible_courses or [],
         'eligible_branches': drive.eligible_branches or company.eligible_branches or [],
@@ -14822,6 +16346,9 @@ def _placement_member_payload(profile):
         'avatar': profile.avatar,
         'access': profile.access,
         'is_master': profile.is_master,
+        # False until the invited person signs up with this email and claims the
+        # profile; the roster shows them as "not signed up yet" until then.
+        'has_account': profile.user_id is not None,
         'created_at': profile.created_at.isoformat() if profile.created_at else None,
     }
 
@@ -14861,22 +16388,23 @@ def placement_cell_members(request):
 
 @require_POST
 def placement_cell_member_create(request):
-    """Add a colleague to the placement department as another ClientProfile.
+    """Record a colleague on the placement department's roster.
 
-    POST /api/placement-cell/members/
+    POST /api/placement-cell/members/create/
         {full_name, official_email, designation?, mobile_number?,
          employee_staff_id?, access?}
-        ->  {member, temporary_password}
+        ->  {member}
 
     Only a Master-access account can do this. A Beta member is read-only by
-    design, so handing out new accounts is a Master-only action, and the new
-    member is always attached to the *requester's own* institution - never to an
-    institution named in the request body, so one college cannot staff another.
+    design, so handing out access to someone else is a Master-only action, and
+    the new member is always attached to the *requester's own* institution -
+    never to an institution named in the request body, so one college cannot
+    staff another.
 
-    The account is created with a generated temporary password, returned once in
-    this response and never stored in plaintext. There is no password-reset flow
-    in this app, so the owner shares it out of band and the member changes it
-    via /api/auth/change-password/ after signing in.
+    This creates no account and no password: only the ClientProfile row, which
+    is the roster entry. The invited person signs up themselves with the same
+    email, chooses their own password, and signup attaches the new account to
+    this profile (see _claim_profile_invite), keeping the access level set here.
     """
     if not request.user.is_authenticated:
         return JsonResponse({'detail': 'Not authenticated.'}, status=401)
@@ -14929,17 +16457,37 @@ def placement_cell_member_create(request):
     except ValidationError as exc:
         return JsonResponse({'detail': ' '.join(exc.messages)}, status=400)
 
-    # The email is the username across this project (see signup), so a repeat
-    # invite lands on the same account instead of forking a second person.
-    existing = User.objects.filter(username__iexact=official_email).first()
-    if existing is not None:
-        if ClientProfile.objects.filter(user=existing).exists():
+    # The email is the username across this project (see signup), so it is the
+    # identity of both the account and the staff record: if either already
+    # exists for this address, inviting again would fork a second person.
+    existing_profile = ClientProfile.objects.filter(
+        official_email__iexact=official_email,
+    ).select_related('institution').first()
+    if existing_profile is not None:
+        if existing_profile.user_id is None:
+            return JsonResponse({
+                'detail': 'This email has already been invited to the placement cell.',
+            }, status=400)
+        if existing_profile.institution_id == institution.pk:
             return JsonResponse(
-                {'detail': 'An account with this email already exists.'}, status=400,
+                {"detail": "This email is already on this college's roster."}, status=400,
             )
+        return JsonResponse({
+            'detail': 'This email already works for another college.',
+        }, status=400)
+
+    if CandidateProfile.objects.filter(
+        Q(personal_email__iexact=official_email) | Q(user__username__iexact=official_email),
+    ).exists():
         return JsonResponse({
             'detail': 'This email is already registered as a Candidate. They cannot be '
                       'added to the placement cell.',
+        }, status=400)
+
+    if User.objects.filter(username__iexact=official_email).exists():
+        return JsonResponse({
+            'detail': 'This email already has a TalentBro account, so they can sign in '
+                      'and cannot be invited again.',
         }, status=400)
 
     # New members start read-only. An owner can promote someone to Master later;
@@ -14949,30 +16497,250 @@ def placement_cell_member_create(request):
     if access not in dict(ClientProfile.ACCESS_CHOICES):
         access = ClientProfile.ACCESS_BETA
 
-    with transaction.atomic():
-        user = User.objects.create(
-            username=official_email, email=official_email, first_name=full_name,
-        )
-        temporary_password = get_random_string(12)
-        user.set_password(temporary_password)
-        user.save()
+    # No User row is created: the invite is the staff record alone. The person
+    # signs up themselves with this same email and chooses their own password,
+    # and signup attaches their account to this profile (see _claim_profile_invite).
+    member = ClientProfile.objects.create(
+        institution=institution,
+        full_name=full_name,
+        official_email=official_email,
+        mobile_number=mobile_number,
+        designation=designation,
+        employee_staff_id=employee_staff_id,
+        access=access,
+    )
 
-        member = ClientProfile.objects.create(
-            user=user,
-            institution=institution,
-            full_name=full_name,
-            official_email=official_email,
-            mobile_number=mobile_number,
-            designation=designation,
-            employee_staff_id=employee_staff_id,
-            access=access,
+    return JsonResponse({'member': _placement_member_payload(member)}, status=201)
+
+
+@require_http_methods(['DELETE'])
+def placement_cell_member_detail(request, member_id):
+    """Remove one member from the signed-in college's placement-cell roster.
+
+    DELETE /api/placement-cell/members/<int:member_id>/  ->  {ok: True}
+
+    Master owners only, the same access level that may invite someone in the first
+    place. Two things are refused rather than allowed to fail halfway:
+
+    * your own row. The roster *is* this account's access to the college, so
+      removing yourself would lock you out of the page that manages it.
+    * the last Master on the roster, for the same reason - nobody would be left
+      who can invite the next member.
+
+    Only the staff record is deleted. A member who has already signed up keeps
+    their own account; they simply stop having access to this college's
+    dashboard, which is what removing a colleague from an office means.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
+
+    requester = ClientProfile.objects.filter(user_id=request.user.pk).first()
+    if requester is None or not requester.is_master:
+        return JsonResponse(
+            {'detail': 'Only a Master access owner can remove members.'}, status=403,
         )
 
+    member = ClientProfile.objects.filter(pk=member_id, institution=institution).first()
+    if member is None:
+        return JsonResponse({'detail': 'Member not found in your college.'}, status=404)
+
+    if member.pk == requester.pk:
+        return JsonResponse(
+            {'detail': 'You cannot remove your own account from the roster.'}, status=400,
+        )
+
+    if member.is_master and not ClientProfile.objects.filter(
+        institution=institution, access=ClientProfile.ACCESS_MASTER,
+    ).exclude(pk=member.pk).exists():
+        return JsonResponse(
+            {'detail': 'Your college must keep at least one Master access owner.'}, status=400,
+        )
+
+    member.delete()
+    return JsonResponse({'ok': True})
+
+
+# ---------------------------------------------------------------------------
+#  Classroom L&D sessions  (institution L&D board)
+# ---------------------------------------------------------------------------
+
+def _classroom_session_payload(session, now):
+    """One session row for the L&D board, split into upcoming vs done.
+
+    ``is_past`` is decided against the *end* of the session, not its start: a
+    class that is still running is not something an officer should be told to
+    go and run again.
+    """
+    starts_at = timezone.localtime(session.starts_at)
+    ends_at = timezone.localtime(session.ends_at)
+    return {
+        'id': str(session.pk),
+        'topic': session.topic,
+        'agenda': session.agenda,
+        'venue': session.venue,
+        'department': session.department,
+        'faculty_name': session.faculty_name,
+        'starts_at': session.starts_at.isoformat(),
+        'ends_at': session.ends_at.isoformat(),
+        'starts_at_display': starts_at.strftime('%a, %d %b %Y'),
+        'starts_at_time': starts_at.strftime('%I:%M %p').lstrip('0'),
+        'ends_at_time': ends_at.strftime('%I:%M %p').lstrip('0'),
+        'duration_minutes': int((session.ends_at - session.starts_at).total_seconds() // 60),
+        'is_past': ends_at <= now,
+        'created_at': session.created_at.isoformat() if session.created_at else None,
+    }
+
+
+@require_GET
+def classroom_ld_sessions(request):
+    """Every classroom session scheduled for the signed-in staff member's college.
+
+    GET /api/classroom-ld-sessions/  ->  {upcoming, done, counts}
+
+    Both halves are returned in one response so the board can render the whole
+    timetable without a second round trip, and each is pre-sorted the way it
+    reads: upcoming soonest-first, done most-recent-first (the model's own
+    ordering is soonest-first, which is the wrong end for history).
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
+
+    now = timezone.now()
+    rows = list(
+        ClassroomLDSession.objects
+        .filter(institution=institution)
+        .order_by('starts_at', 'topic')
+    )
+
+    payload = [_classroom_session_payload(session, now) for session in rows]
+    upcoming = [row for row in payload if not row['is_past']]
+    done = [row for row in payload if row['is_past']]
+    done.reverse()
     return JsonResponse({
-        'member': _placement_member_payload(member),
-        # Shown once, to the owner, immediately after they add the member.
-        'temporary_password': temporary_password,
-    }, status=201)
+        'upcoming': upcoming,
+        'done': done,
+        'counts': {'upcoming': len(upcoming), 'done': len(done)},
+    })
+
+
+@require_POST
+def classroom_ld_session_create(request):
+    """Schedule one classroom L&D session.
+
+    POST /api/classroom-ld-sessions/create/
+        {topic, agenda?, venue?, department?, faculty_name?, starts_at, ends_at}
+        ->  {session}
+
+    Like every other institution endpoint the session is attached to the
+    *requester's own* institution, never to one named in the body, so one college
+    cannot publish into another's board.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
+
+    data = _json_body(request)
+    if data is None:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    topic = str(data.get('topic') or '').strip()
+    agenda = str(data.get('agenda') or '').strip()
+    venue = str(data.get('venue') or '').strip()
+    department = str(data.get('department') or '').strip()
+    faculty_name = str(data.get('faculty_name') or '').strip()
+
+    if not topic:
+        return JsonResponse({'detail': 'Please give the session a topic.'}, status=400)
+
+    # parse_datetime rather than parse_date: the board shows the hour, so a date
+    # on its own is not enough to place a class on a timetable.
+    starts_at = parse_datetime(str(data.get('starts_at') or '').strip())
+    ends_at = parse_datetime(str(data.get('ends_at') or '').strip())
+    if starts_at is None or ends_at is None:
+        return JsonResponse(
+            {'detail': 'Enter both a start time and an end time.'}, status=400,
+        )
+    # A browser sends an offset-aware stamp, but a naive one is accepted too and
+    # read in the server's own timezone, otherwise scheduling for a college in
+    # another zone silently shifts by hours.
+    if timezone.is_naive(starts_at):
+        starts_at = timezone.make_aware(starts_at, timezone.get_current_timezone())
+    if timezone.is_naive(ends_at):
+        ends_at = timezone.make_aware(ends_at, timezone.get_current_timezone())
+    if ends_at <= starts_at:
+        return JsonResponse(
+            {'detail': 'The session must end after it starts.'}, status=400,
+        )
+
+    session = ClassroomLDSession.objects.create(
+        institution=institution,
+        topic=topic,
+        agenda=agenda,
+        venue=venue,
+        department=department,
+        faculty_name=faculty_name,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        created_by=request.user,
+    )
+    # Announced to the whole college only once the class is actually on the
+    # board, so the notice can never describe a session a later validation
+    # rolled back. The wording is built from the same clock reading the card
+    # shows, so the inbox and the board cannot disagree about the day. Left
+    # without a redirect: a class notice is a heads-up, not a link to open.
+    starts_at_local = timezone.localtime(session.starts_at)
+    ends_at_local = timezone.localtime(session.ends_at)
+    _broadcast_institution_news(
+        institution,
+        request.user,
+        'New classroom session scheduled',
+        f'"{session.topic}" runs {starts_at_local.strftime("%a, %d %b %Y")}, '
+        f'{starts_at_local.strftime("%I:%M %p").lstrip("0")} to '
+        f'{ends_at_local.strftime("%I:%M %p").lstrip("0")}'
+        + (f' for {session.department}' if session.department else '')
+        + (f' in {session.venue}' if session.venue else '')
+        + '.',
+    )
+    return JsonResponse(
+        {'session': _classroom_session_payload(session, timezone.now())}, status=201,
+    )
+
+
+@require_http_methods(['DELETE'])
+def classroom_ld_session_detail(request, session_id):
+    """Remove one scheduled session.
+
+    DELETE /api/classroom-ld-sessions/<uuid:session_id>/  ->  {ok: True}
+
+    Scoped to the requester's own institution, so a guessed UUID from another
+    college reads as "not found" rather than deleting it.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
+
+    session = ClassroomLDSession.objects.filter(
+        pk=session_id, institution=institution,
+    ).first()
+    if session is None:
+        return JsonResponse({'detail': 'Session not found in your college.'}, status=404)
+
+    session.delete()
+    return JsonResponse({'ok': True})
 
 
 @require_GET
@@ -15004,7 +16772,6 @@ def institution_overview(request):
     active_drives = Drive.objects.filter(
         institution=institution, status__in=['upcoming', 'ongoing'],
     ).count()
-    verified = candidates.filter(id_verified=True).count()
 
     kpis = {
         'total_students': total,
@@ -15019,8 +16786,6 @@ def institution_overview(request):
         'active_drives': active_drives,
         'total_openings': _institution_openings(institution),
         'super_dream': companies.filter(tier='super_dream').count(),
-        'verified': verified,
-        'unverified': total - verified,
     }
 
     funnel = [
@@ -15055,25 +16820,7 @@ def institution_overview(request):
         end_year = max(years)
 
     return JsonResponse({
-        'institution': {
-            'name': institution.name,
-            'institution_type': institution.institution_type,
-            'website': institution.website,
-            'email_domain': institution.email_domain,
-            'address': institution.address,
-            'city': institution.city,
-            'state': institution.state,
-            'pin_code': institution.pin_code,
-            'logo': institution.logo,
-            'placement_department_name': institution.placement_department_name,
-            'placement_office_email': institution.placement_office_email,
-            'approximate_student_strength': institution.approximate_student_strength,
-            'courses_offered': institution.courses_offered or [],
-            # Institution.departments is stored as a JSON array string
-            # ('["Computer Science", "IT"]'), so a plain split(',') hands the
-            # caller fragments like '["Computer Science"'. Parse it properly.
-            'departments': _institution_department_list(institution),
-        },
+        'institution': _institution_identity_payload(institution),
         'client': client_payload,
         'kpis': kpis,
         'funnel': funnel,
@@ -15081,6 +16828,222 @@ def institution_overview(request):
         'departments': _department_stats(institution),
         'tiers': tiers,
         'batch': {'year': end_year or 2026, 'students': total},
+    })
+
+
+def _institution_identity_payload(institution):
+    """The Institution fields the client is allowed to see and change.
+
+    Shared by the overview endpoint and the update endpoint so the shape of the
+    college's record can only ever be defined once. `email_domain` is included
+    because the placement cell needs it to issue member invites on its own
+    domain; it is deliberately NOT editable below, since changing it would
+    silently orphan the sign-in addresses already handed out.
+    """
+    return {
+        'name': institution.name,
+        'institution_type': institution.institution_type,
+        'website': institution.website,
+        'email_domain': institution.email_domain,
+        'address': institution.address,
+        'city': institution.city,
+        'state': institution.state,
+        'pin_code': institution.pin_code,
+        'logo': institution.logo,
+        'placement_department_name': institution.placement_department_name,
+        'placement_office_email': institution.placement_office_email,
+        'approximate_student_strength': institution.approximate_student_strength,
+        'courses_offered': institution.courses_offered or [],
+        # Institution.departments is stored as a JSON array string
+        # ('["Computer Science", "IT"]'), so a plain split(',') hands the
+        # caller fragments like '["Computer Science"'. Parse it properly.
+        'departments': _institution_department_list(institution),
+    }
+
+
+@require_http_methods(['PATCH', 'POST'])
+def institution_update(request):
+    """Correct the college record behind the signed-in staff member's dashboard.
+
+    PATCH /api/institution/update/  ->  {"institution": {...}}
+
+    Master access only. This is the college's own legal and contact record, and
+    the same bar that gates removing a colleague from the roster gates changing
+    it: a Beta account is read-only across the placement cell, and a view-only
+    account must not be able to rewrite the address its students are told to
+    report to.
+
+    Only the keys present in the body are written, which keeps the endpoint
+    usable for a full-form save and for a single-field correction alike. The
+    identity keys are immutable here and are ignored rather than trusted from the
+    client: `user` (account ownership), `email_domain` (the domain member invites
+    are issued on), `companies` (now derived from the Company rows) and
+    `website` (not editable from the placement cell at all).
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'Only institution staff can edit the college record.'}, status=403,
+        )
+
+    requester = ClientProfile.objects.filter(user_id=request.user.pk).first()
+    if requester is None or not requester.is_master:
+        return JsonResponse(
+            {'detail': 'Only a Master account can edit the college record.'}, status=403,
+        )
+
+    try:
+        data = json.loads(request.body or '{}')
+    except ValueError:
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+    if not isinstance(data, dict):
+        return JsonResponse({'detail': 'Invalid JSON body.'}, status=400)
+
+    # Free-text contact and identity fields. Each is trimmed, and each is
+    # validated only when the client actually sent it, so a partial save cannot
+    # be blocked by a field it never touched.
+    required_text = {
+        'name': 'College name',
+        'placement_department_name': 'Placement department name',
+        'address': 'Campus address',
+        'city': 'City',
+        'state': 'State',
+        'placement_office_email': 'Placement office email',
+    }
+    for field, label in required_text.items():
+        if field not in data:
+            continue
+        value = str(data.get(field) or '').strip()
+        if not value:
+            return JsonResponse({'detail': f'{label} is required.'}, status=400)
+        setattr(institution, field, value)
+    # 'website' is intentionally absent from the writable set: it is not editable
+    # from the placement cell, so a client that sends it has its value ignored.
+
+    if 'institution_type' in data:
+        institution_type = str(data.get('institution_type') or '').strip()
+        if institution_type not in dict(INSTITUTION_TYPE_CHOICES):
+            return JsonResponse({'detail': 'Unknown institution type.'}, status=400)
+        institution.institution_type = institution_type
+
+    if 'placement_office_email' in data:
+        # Same shape the student-email checks use: one @, no spaces, a dotted
+        # domain with a real TLD. PlacementOfficeEmailField would catch this too,
+        # but only on full_clean(), which reports every problem at once.
+        if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]{2,}', institution.placement_office_email):
+            return JsonResponse({'detail': 'Enter a valid placement office email.'}, status=400)
+
+    if 'pin_code' in data:
+        pin_code = str(data.get('pin_code') or '').strip()
+        # Six digits and no leading zero, matching PIN_CODE_VALIDATOR on the
+        # model. full_clean() is not used here so one bad field reports one
+        # message instead of a dict the client would have to unpack.
+        if not re.fullmatch(r'[1-9][0-9]{5}', pin_code):
+            return JsonResponse({'detail': 'Enter a valid 6-digit PIN Code.'}, status=400)
+        institution.pin_code = pin_code
+
+    if 'approximate_student_strength' in data:
+        raw_strength = data.get('approximate_student_strength')
+        try:
+            strength = int(raw_strength)
+        except (TypeError, ValueError):
+            return JsonResponse(
+                {'detail': 'Student strength must be a whole number.'}, status=400,
+            )
+        if strength < 0:
+            return JsonResponse(
+                {'detail': 'Student strength cannot be negative.'}, status=400,
+            )
+        institution.approximate_student_strength = strength
+
+    if 'courses_offered' in data:
+        raw_courses = data.get('courses_offered')
+        courses = (
+            [str(c).strip() for c in raw_courses]
+            if isinstance(raw_courses, list)
+            else [c.strip() for c in str(raw_courses or '').split(',')]
+        )
+        courses = [c for c in courses if c]
+        # Institution.clean() rejects duplicates and anything outside the fixed
+        # catalogue; the model only runs clean() on full_clean(), so the same
+        # rules are applied here to keep a bad course list out of the database.
+        unknown = [c for c in courses if c not in COURSES_OFFERED]
+        if unknown:
+            return JsonResponse(
+                {'detail': f'Invalid course(s): {", ".join(unknown)}.'}, status=400,
+            )
+        if len(set(courses)) != len(courses):
+            return JsonResponse({'detail': 'Duplicate courses are not allowed.'}, status=400)
+        institution.courses_offered = courses
+
+    if 'departments' in data:
+        # Stored as a JSON array string; parsed back through the same helper the
+        # read path uses so a round-trip cannot change the shape.
+        raw_departments = data.get('departments')
+        departments = (
+            [str(d).strip() for d in raw_departments]
+            if isinstance(raw_departments, list)
+            else [d.strip() for d in str(raw_departments or '').split(',')]
+        )
+        institution.departments = json.dumps([d for d in departments if d])
+
+    institution.save()
+    return JsonResponse({'institution': _institution_identity_payload(institution)})
+
+
+@require_GET
+def institution_billing(request):
+    """Pay-as-you-go bill for the institution: what its candidates have spent.
+
+    The billed figure is the real, live sum of ``CandidateProfile.cost_incurred``
+    over every candidate belonging to this institution. Each of those values
+    already carries the 40% service margin, so the institute bill is billed in
+    the same money unit the per-candidate figure is stored in — no second
+    pricing table to drift out of step.
+
+    ``advance_paid`` is the credit the institute prepaid; the caller subtracts
+    it to get the amount actually due. The field is returned rather than
+    pre-subtracted so the billing page can show the full breakdown.
+
+    GET /api/institution/billing/  ->  {institution, total_cost_consumed, ...}
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse({'detail': 'No institution linked to this account.'}, status=404)
+
+    candidates = CandidateProfile.objects.filter(college=institution)
+    # Aggregate in the database rather than in Python: a college roll can be
+    # thousands of rows, and cost_incurred is indexed-away-free so summing the
+    # column is far cheaper than pulling every row into memory.
+    totals = candidates.aggregate(
+        total=Sum('cost_incurred'),
+        highest=Max('cost_incurred'),
+    )
+    total = totals['total'] or Decimal('0')
+    highest = totals['highest'] or Decimal('0')
+    count = candidates.count()
+    # Candidates who have actually burnt something, so the UI can say "x of y
+    # students have used the product" rather than just quoting a sum.
+    with_cost = candidates.filter(cost_incurred__gt=0).count()
+
+    return JsonResponse({
+        'institution': {
+            'name': institution.name,
+            'institution_type': institution.institution_type,
+            'logo': institution.logo,
+        },
+        'total_cost_consumed': float(total),
+        'highest_candidate_cost': float(highest),
+        'average_candidate_cost': float(total / count) if count else 0.0,
+        'candidate_count': count,
+        'candidates_with_cost': with_cost,
+        'advance_paid': float(BILLING_ADVANCE_PAID),
+        'generated_at': timezone.now().isoformat(),
     })
 
 
@@ -15186,6 +17149,729 @@ def students_list(request):
         # The institution's own approximate student strength, which is broader
         # still: it covers students who have no candidate profile in the system.
         'approximate_student_strength': institution.approximate_student_strength,
+    })
+
+
+def _scoped_candidate(request, student_id):
+    """One candidate of the signed-in staff member's own college.
+
+    Returns ``(candidate, error_response)``: exactly one of the two is None. The
+    lookup is filtered by ``college`` rather than fetched by id, so a candidate
+    of another institution simply does not exist for this caller - which is what
+    keeps every staff-facing student page from becoming a way to read the whole
+    platform's candidate records.
+    """
+    if not request.user.is_authenticated:
+        return None, JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return None, JsonResponse(
+            {'detail': 'No institution linked to this account.'}, status=404,
+        )
+
+    candidate = (
+        CandidateProfile.objects
+        .filter(college=institution)
+        .filter(candidate_id=student_id)
+        .first()
+    )
+    if candidate is None:
+        return None, JsonResponse({'detail': 'Student not found in your college.'}, status=404)
+
+    return candidate, None
+
+
+def _candidate_detail_payload(c, ranks=None):
+    """Every stored field on a CandidateProfile, for the staff-only record view.
+
+    ``_candidate_payload`` is deliberately the narrow directory row: it feeds
+    tables, exports and leaderboards. The detail page is a record view - one
+    placement-cell officer looking at one student - so it returns the whole row,
+    including what the list leaves out (personal email, DOB, links,
+    certifications, projects, internships, last login, the persisted readiness
+    and per-pillar standings) rather than a hand-picked subset that would need
+    editing every time the model grows a column.
+    """
+    account = None
+    if c.user_id:
+        account = {
+            'id': c.user_id,
+            'username': c.user.username,
+            'email': c.user.email,
+            'first_name': c.user.first_name,
+            'last_name': c.user.last_name,
+            'is_active': c.user.is_active,
+            'is_staff': c.user.is_staff,
+            'date_joined': c.user.date_joined.isoformat() if c.user.date_joined else None,
+            'last_login': c.user.last_login.isoformat() if c.user.last_login else None,
+        }
+
+    return {
+        'id': str(c.candidate_id),
+        'full_name': c.full_name,
+        'first_name': c.first_name,
+        'middle_name': c.middle_name,
+        'last_name': c.last_name,
+        'college': c.college.name if c.college_id else '',
+        'college_id': str(c.college_id) if c.college_id else None,
+        'department': c.department,
+        'program': c.program,
+        'start_year': c.start_year,
+        'end_year': c.end_year,
+        'personal_email': c.personal_email,
+        'mobile_number': c.mobile_number,
+        'avatar': c.avatar,
+        'bio': c.bio,
+        'date_of_birth': c.date_of_birth.isoformat() if c.date_of_birth else None,
+        'gender': c.gender,
+        'cgpa': float(c.cgpa) if c.cgpa is not None else None,
+        'placement_status': c.placement_status,
+        'placement_eligible': _effective_eligible(c),
+        'linkedin_url': c.linkedin_url,
+        'github_url': c.github_url,
+        'portfolio_url': c.portfolio_url,
+        'skills': c.skills or [],
+        'certifications': c.certifications or [],
+        'projects': c.projects or [],
+        'internships': c.internships or [],
+        'extracurricular_activities': c.extracurricular_activities or [],
+        'preferred_roles': c.preferred_roles or [],
+        'preferred_locations': c.preferred_locations or [],
+        'preferred_language': c.preferred_language,
+        'expected_ctc': float(c.expected_ctc) if c.expected_ctc is not None else None,
+        'time_spent': c.time_spent,
+        'account_status': c.account_status,
+        'last_login_at': c.last_login_at.isoformat() if c.last_login_at else None,
+        'cost_incurred': float(c.cost_incurred or 0),
+        'readiness_score': c.readiness_score,
+        'readiness_overall_rank': c.readiness_overall_rank,
+        'readiness_overall_total': c.readiness_overall_total,
+        'readiness_department_rank': c.readiness_department_rank,
+        'readiness_department_total': c.readiness_department_total,
+        'readiness_components': c.readiness_components or {},
+        'readiness_updated_at': c.readiness_updated_at.isoformat()
+        if c.readiness_updated_at else None,
+        'mock_interview_score': c.mock_interview_score,
+        'mock_interview_rank': c.mock_interview_rank,
+        'mock_interview_total': c.mock_interview_total,
+        'mock_interview_department_rank': c.mock_interview_department_rank,
+        'mock_interview_department_total': c.mock_interview_department_total,
+        'self_training_score': c.self_training_score,
+        'self_training_rank': c.self_training_rank,
+        'self_training_total': c.self_training_total,
+        'self_training_department_rank': c.self_training_department_rank,
+        'self_training_department_total': c.self_training_department_total,
+        'created_at': c.created_at.isoformat() if c.created_at else None,
+        'updated_at': c.updated_at.isoformat() if c.updated_at else None,
+        'has_account': c.user_id is not None,
+        'account': account,
+        'ranks': ranks or {},
+        # The option lists behind the choice columns, so the page can print the
+        # stored code ("male", "btech") as the label a human would say.
+        'choices': {
+            'gender': GENDER_CHOICES,
+            'program': COURSE_CHOICES,
+            'placement_status': PLACEMENT_STATUS_CHOICES,
+            'account_status': ACCOUNT_STATUS_CHOICES,
+        },
+    }
+
+
+@require_GET
+def student_data(request, student_id):
+    """The complete stored record of one candidate in the signed-in college.
+
+    GET /api/students/<uuid:student_id>/  ->  {student, activity_url}
+
+    Institution staff only, and only for their own roll (see
+    :func:`_scoped_candidate`). Every column the model holds is returned, so the
+    placement cell sees what is actually on record rather than the handful of
+    fields the directory table chooses to show.
+    """
+    candidate, error = _scoped_candidate(request, student_id)
+    if error is not None:
+        return error
+
+    ranks = _profile_ranks(candidate)
+    return JsonResponse({
+        'student': _candidate_detail_payload(candidate, ranks=ranks),
+        'activity_url': f'/api/student-activity/{candidate.candidate_id}/',
+    })
+
+
+# ---------------------------------------------------------------------------
+#  Student activity  (staff view of one candidate's practice history)
+# ---------------------------------------------------------------------------
+#
+# Every practice table hangs off the auth User, and every existing view that
+# reads one hard-scopes it to ``user=request.user`` - the student themselves.
+# These builders are the same reads with the user as an argument, so a
+# placement-cell officer can read one of their own students' history without
+# loosening any of those endpoints.
+
+# Session rows are capped so one heavy student cannot return an unbounded
+# payload. Averages are always computed over the *whole* record, never the
+# capped window, so the figures cannot shift as the reader pages.
+ACTIVITY_SESSION_LIMIT = 500
+
+
+def _mean(values):
+    """Mean of the usable numbers in ``values``, or None when there are none."""
+    numbers = [value for value in values if isinstance(value, (int, float))
+               and not isinstance(value, bool)]
+    if not numbers:
+        return None
+    return round(sum(numbers) / len(numbers), 1)
+
+
+def _score_trend(scores):
+    """Latest / best / first score of a newest-first list, plus its mean."""
+    return {
+        'avg_score': _mean(scores),
+        'latest_score': scores[0] if scores else None,
+        'best_score': max(scores) if scores else None,
+        'first_score': scores[-1] if scores else None,
+    }
+
+
+def _numeric_averages(rows, fields):
+    """Mean of each named numeric field across every analysed row.
+
+    Shared by the Communication and English modules, which are both Gemini-scored
+    and both show "averages across all sessions". Text fields are never passed
+    in - they hold the coach's prose and have no numeric meaning.
+    """
+    averages = {}
+    for field in fields:
+        values = [_as_number(getattr(row, field, None)) for row in rows]
+        mean = _mean([value for value in values if value is not None])
+        if mean is not None:
+            averages[field] = mean
+    return averages
+
+
+def _mock_interview_activity(user):
+    """Every mock interview, with the score of each already-stored analysis.
+
+    Only analyses that already exist are read. The interview detail endpoint
+    generates one on demand for the student; doing that here would spend a
+    Gemini call for every historical interview the moment an officer opened the
+    page, so an unscored interview is reported as unscored instead.
+    """
+    interviews = list(
+        MockInterview.objects.filter(user=user).prefetch_related('messages')
+        .order_by('-created_at', '-pk')
+    )
+    analyses = {
+        analysis.interview_id: analysis
+        for analysis in MockInterviewAnalysis.objects.filter(user=user)
+    }
+
+    sessions = []
+    scores = []
+    for interview in interviews:
+        analysis = analyses.get(interview.pk)
+        score = None
+        scored_dimensions = 0
+        if analysis is not None:
+            payload = _mock_analysis_payload(analysis)
+            score = payload['overall_score']
+            scored_dimensions = payload['scored_dimensions']
+            if score is not None:
+                scores.append(score)
+        sessions.append({
+            'id': str(interview.pk),
+            'title': ' · '.join(
+                part for part in (interview.company_name, interview.role) if part
+            ) or 'Mock interview',
+            'company_name': interview.company_name,
+            'role': interview.role,
+            'status': interview.status,
+            'duration': interview.duration,
+            'suspection': interview.suspection or 0,
+            'panelists': list(interview.panelists or []),
+            'message_count': interview.messages.count(),
+            'overall_score': score,
+            'scored_dimensions': scored_dimensions,
+            'created_at': interview.created_at.isoformat(),
+            'updated_at': interview.updated_at.isoformat(),
+        })
+
+    completed = sum(
+        1 for interview in interviews
+        if interview.status == MOCK_INTERVIEW_STATUS_COMPLETED
+    )
+    summary = {
+        'sessions': len(interviews),
+        'completed': completed,
+        'scored': len(scores),
+        'completion_rate': (
+            round(completed / len(interviews) * 100) if interviews else None
+        ),
+    }
+    summary.update(_score_trend(scores))
+    return sessions, summary
+
+
+def _question_module_activity(user, model):
+    """Sessions of one of the five one-question-per-chat practice modules.
+
+    APLR, Basic Math, Situational, Technical and DSA share this model shape, so
+    they share this reader rather than eight near-copies of it.
+    """
+    rows = list(model.objects.filter(user=user).order_by('-created_at', '-pk'))
+    sessions = [{
+        'id': str(row.pk),
+        'title': row.title,
+        'category': row.category,
+        'status': row.status,
+        'attempts': row.attempts,
+        'hints_used': row.hints_used,
+        'points_awarded': row.points_awarded,
+        'star_rating': row.star_rating,
+        'solved_at': row.solved_at.isoformat() if row.solved_at else None,
+        'created_at': row.created_at.isoformat(),
+    } for row in rows]
+
+    solved = [row for row in rows if row.status.endswith('solved')]
+    summary = {
+        'sessions': len(rows),
+        'solved': len(solved),
+        'gave_up': sum(1 for row in rows if row.status.endswith('gave_up')),
+        'active': sum(1 for row in rows if row.status.endswith('active')),
+        'solve_rate': round(len(solved) / len(rows) * 100) if rows else None,
+        'avg_attempts': _mean([row.attempts for row in rows]),
+        'avg_hints_used': _mean([row.hints_used for row in rows]),
+        'avg_points_awarded': _mean([row.points_awarded for row in rows]),
+        'avg_star_rating': _mean([row.star_rating for row in rows]),
+    }
+    return sessions, summary
+
+
+def _communication_activity(user):
+    """Spoken-communication practice sessions and the mean of every score."""
+    rows = list(
+        CommunicationTraining.objects.filter(user=user).order_by('-created_at', '-pk')
+    )
+    analyzed = [row for row in rows if row.finalized_at]
+    sessions = [{
+        'id': str(row.pk),
+        'title': row.title,
+        'status': row.status,
+        'communication_score': row.communication_score,
+        'finalized_at': row.finalized_at.isoformat() if row.finalized_at else None,
+        'created_at': row.created_at.isoformat(),
+        'scores': {
+            field: _as_number(getattr(row, field, None))
+            for field in _COMMUNICATION_PERCENT_FIELDS
+        },
+    } for row in rows]
+
+    scores = [
+        _as_number(row.communication_score) for row in analyzed
+    ]
+    scores = [score for score in scores if score is not None]
+    summary = {
+        'sessions': len(rows),
+        'analyzed': len(analyzed),
+        'averages': _numeric_averages(analyzed, _COMMUNICATION_NUMERIC_FIELDS),
+    }
+    summary.update(_score_trend(scores))
+    return sessions, summary
+
+
+def _english_activity(user):
+    """English-writing practice sessions and the mean of every score."""
+    rows = list(
+        EnglishTrainingSession.objects.filter(user=user).order_by('-created_at', '-pk')
+    )
+    analyzed = [row for row in rows if row.finalized_at]
+    sessions = [{
+        'id': str(row.pk),
+        'title': row.title,
+        'status': row.status,
+        'writing_score': row.writing_score,
+        'finalized_at': row.finalized_at.isoformat() if row.finalized_at else None,
+        'created_at': row.created_at.isoformat(),
+        'scores': {
+            field: _as_number(getattr(row, field, None))
+            for field in _ENGLISH_ANALYSIS_FIELDS
+        },
+    } for row in rows]
+
+    scores = [
+        _as_number(row.writing_score) for row in analyzed
+    ]
+    scores = [score for score in scores if score is not None]
+    summary = {
+        'sessions': len(rows),
+        'analyzed': len(analyzed),
+        'averages': _numeric_averages(analyzed, _ENGLISH_ANALYSIS_FIELDS),
+    }
+    summary.update(_score_trend(scores))
+    return sessions, summary
+
+
+def _gd_activity(user):
+    """Group-discussion rounds and the mean of every criterion."""
+    rows = list(GdTraining.objects.filter(user=user).order_by('-created_at', '-pk'))
+    sessions = [{
+        'id': str(row.pk),
+        'title': row.topic or row.title or 'Group discussion',
+        'topic': row.topic,
+        'status': row.status,
+        'phase': row.phase,
+        'duration_minutes': row.duration_minutes,
+        'overall_score': row.overall_score,
+        'grade': row.grade,
+        'ended_at': row.ended_at.isoformat() if row.ended_at else None,
+        'created_at': row.created_at.isoformat(),
+        'criteria': [
+            {'label': label, 'score': getattr(row, field)}
+            for field, label in _GD_CRITERIA_LABELS
+        ],
+    } for row in rows]
+
+    scores = [
+        _as_number(row.overall_score) for row in rows
+    ]
+    scores = [score for score in scores if score is not None]
+    summary = {
+        'sessions': len(rows),
+        'avg_duration_minutes': _mean([row.duration_minutes for row in rows]),
+        'averages': _numeric_averages(
+            rows, [field for field, _label in _GD_CRITERIA_LABELS]
+        ),
+    }
+    summary.update(_score_trend(scores))
+    return sessions, summary
+
+
+def _question_module_reader(model):
+    """Bind one question-module model to the shared session reader."""
+    def read(user):
+        return _question_module_activity(user, model)
+    return read
+
+
+# The cards the activity page renders, in display order. The five question
+# modules are generated from PERF_QUESTION_MODULES so a module added to the
+# readiness scoring shows up here without a second edit.
+ACTIVITY_MODULES = (
+    ('mock_interview', 'Mock Interview', _mock_interview_activity),
+) + tuple(
+    (key, label, _question_module_reader(model))
+    for key, label, model in PERF_QUESTION_MODULES
+) + (
+    ('communication', PERF_MODULE_LABELS['communication'], _communication_activity),
+    ('english', PERF_MODULE_LABELS['english'], _english_activity),
+    ('gd', PERF_MODULE_LABELS['gd'], _gd_activity),
+)
+
+
+@require_GET
+def student_activity(request, student_id):
+    """One candidate's mock interviews and self-training sessions, with averages.
+
+    GET /api/student-activity/<uuid:student_id>/
+        ->  {student, modules: [{key, label, summary}], sessions: [...], totals}
+
+    Institution staff only, and only for their own roll (see
+    :func:`_scoped_candidate`). ``modules`` is one card per practice area with
+    the averages across that student's whole record; ``sessions`` is the same
+    data flattened, each row tagged with its ``module``, so the page can show a
+    module's full history without another request.
+    """
+    candidate, error = _scoped_candidate(request, student_id)
+    if error is not None:
+        return error
+
+    # Students added by the placement cell have a profile but no account yet, so
+    # they have no practice record to read yet.
+    if not candidate.user_id:
+        return JsonResponse({
+            'student': {
+                'id': str(candidate.candidate_id),
+                'full_name': candidate.full_name,
+                'has_account': False,
+            },
+            'modules': [
+                {'key': key, 'label': label, 'summary': {'sessions': 0}}
+                for key, label, _reader in ACTIVITY_MODULES
+            ],
+            'sessions': [],
+            'totals': {'sessions': 0, 'modules_used': 0, 'last_activity_at': None},
+            'truncated': False,
+        })
+
+    user = candidate.user
+    modules = []
+    sessions = []
+    last_activity_at = None
+    for key, label, reader in ACTIVITY_MODULES:
+        module_sessions, summary = reader(user)
+        total = summary.get('sessions', 0)
+        for row in module_sessions:
+            sessions.append({'module': key, 'module_label': label, **row})
+        if total:
+            first_at = module_sessions[0].get('created_at') if module_sessions else None
+            if first_at and (last_activity_at is None or first_at > last_activity_at):
+                last_activity_at = first_at
+        modules.append({'key': key, 'label': label, 'summary': summary})
+
+    sessions.sort(key=lambda row: (row.get('created_at') or '', row['module']), reverse=True)
+    truncated = len(sessions) > ACTIVITY_SESSION_LIMIT
+    return JsonResponse({
+        'student': {
+            'id': str(candidate.candidate_id),
+            'full_name': candidate.full_name,
+            'department': candidate.department,
+            'program': candidate.program,
+            'end_year': candidate.end_year,
+            'has_account': True,
+        },
+        'modules': modules,
+        'sessions': sessions[:ACTIVITY_SESSION_LIMIT],
+        'totals': {
+            'sessions': len(sessions),
+            'modules_used': sum(1 for m in modules if m['summary'].get('sessions')),
+            'last_activity_at': last_activity_at,
+        },
+        'truncated': truncated,
+    })
+
+
+@require_GET
+def student_interview_evidence(request, interview_id):
+    """One student's mock interview as it actually happened: the full transcript.
+
+    GET /api/student-interview/<uuid:interview_id>/evidence/
+        ->  {student: {...}, interview: {...messages, panelist_response}}
+
+    The evidence behind a session card on the module history page. Scoped the same
+    way as :func:`_scoped_candidate` - an interview is only readable by a staff
+    member of the college that owns the candidate who ran it, so the lookup is on
+    the interview's own owner rather than on an id the caller supplies.
+
+    A pure read of what is stored. The student-facing detail endpoint generates an
+    analysis on demand; this one never calls the model, so opening a page full of
+    session cards cannot quietly spend a Gemini call per interview. An interview
+    with no stored analysis therefore reports ``analysis: null``.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    interview = (
+        MockInterview.objects
+        .filter(pk=interview_id)
+        .select_related('user')
+        .prefetch_related('messages')
+        .first()
+    )
+    if interview is None:
+        return JsonResponse({'detail': 'Interview not found.'}, status=404)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'No institution linked to this account.'}, status=404,
+        )
+
+    candidate = CandidateProfile.objects.filter(
+        college=institution, user=interview.user,
+    ).first()
+    if candidate is None:
+        return JsonResponse({'detail': 'Interview not found in your college.'}, status=404)
+
+    return JsonResponse({
+        'student': {
+            'id': str(candidate.candidate_id),
+            'full_name': candidate.full_name,
+        },
+        'interview': _mock_interview_payload(interview, include_messages=True),
+    })
+
+
+def _question_session_payload(row):
+    """One practice question as the student met it, with its answer attached.
+
+    Shared by the five question modules: APLR, Basic Math, Situational,
+    Technical and DSA all carry the same ``question`` / ``answer`` /
+    ``solution`` / ``transcript`` columns, so they share one payload shape
+    rather than five near-copies.
+
+    The transcript is filtered down to turns that actually carry text. It is a
+    JSON column the student chat appends to, so a turn with no ``content`` is a
+    half-written row, and printing an empty bubble for one reads as a message
+    the student never sent.
+    """
+    return {
+        'id': str(row.pk),
+        'title': row.title,
+        'category': row.category,
+        'status': row.status,
+        'question': row.question,
+        'answer': row.answer,
+        'solution': row.solution,
+        'transcript': [
+            {
+                'role': str(entry.get('role') or ''),
+                'content': str(entry.get('content') or ''),
+                'created_at': entry.get('created_at'),
+            }
+            for entry in (row.transcript or [])
+            if isinstance(entry, dict) and entry.get('content')
+        ],
+        'attempts': row.attempts,
+        'hints_used': row.hints_used,
+        'points_awarded': row.points_awarded,
+        'star_rating': row.star_rating,
+        'solved_at': row.solved_at.isoformat() if row.solved_at else None,
+        'created_at': row.created_at.isoformat(),
+        'updated_at': row.updated_at.isoformat(),
+    }
+
+
+@require_GET
+def student_question_session_evidence(request, session_id):
+    """One practice question, its chat and its stored answer.
+
+    GET /api/student-question/<uuid:session_id>/evidence/
+        ->  {student, module, module_label, session: {...}}
+
+    The evidence behind a session card on the module history page for APLR,
+    Basic Math, Situational Problem Solving, Technical / Coding and DSA: the
+    question as it was asked, every reply the student wrote, and the answer and
+    solution stored against it.
+
+    Scoped the same way as :func:`student_interview_evidence` - the session is
+    looked up first, then its owner is checked against the signed-in officer's
+    own college, so the id the caller supplies is never enough on its own.
+
+    Like that endpoint this is a pure read of what is stored. Nothing is
+    generated or re-scored when it is opened, so browsing a page of session
+    cards cannot spend a model call per question.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'No institution linked to this account.'}, status=404,
+        )
+
+    # The five question modules share this one shape, so one walk of
+    # PERF_QUESTION_MODULES finds the row whichever table it lives in. There is
+    # no student id in the URL to filter on, so the row is found by pk and then
+    # its owner is checked - a match in a college this officer cannot see is
+    # reported as not found rather than as a permission error, so the endpoint
+    # cannot be used to confirm a session id exists elsewhere.
+    for key, label, model in PERF_QUESTION_MODULES:
+        row = model.objects.filter(pk=session_id).select_related('user').first()
+        if row is None:
+            continue
+
+        candidate = CandidateProfile.objects.filter(
+            college=institution, user=row.user,
+        ).first()
+        if candidate is None:
+            return JsonResponse({'detail': 'Session not found in your college.'}, status=404)
+
+        return JsonResponse({
+            'student': {
+                'id': str(candidate.candidate_id),
+                'full_name': candidate.full_name,
+            },
+            'module': key,
+            'module_label': label,
+            'session': _question_session_payload(row),
+        })
+
+    return JsonResponse({'detail': 'Session not found.'}, status=404)
+
+
+@require_GET
+def student_english_session_evidence(request, session_id):
+    """One English writing session: the chat, and every correction flagged in it.
+
+    GET /api/student-english/<uuid:session_id>/evidence/
+        ->  {student, module, module_label, session: {...}}
+
+    The evidence behind a session card on the module history page for English
+    Writing: the transcript as it happened, and Maya's structured ``mistakes``
+    list - each one the phrase the student wrote and the corrected phrasing
+    beside it - so a coach reads the correction rather than having to infer it.
+
+    Scoped and read-only in exactly the same way as
+    :func:`student_question_session_evidence`. Nothing is generated here: a
+    session with no stored analysis returns its transcript with empty scores and
+    an empty mistake list, which is what was actually recorded.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({'detail': 'Not authenticated.'}, status=401)
+
+    institution = _client_institution(request.user)
+    if institution is None:
+        return JsonResponse(
+            {'detail': 'No institution linked to this account.'}, status=404,
+        )
+
+    session = (
+        EnglishTrainingSession.objects
+        .filter(pk=session_id)
+        .select_related('user')
+        .first()
+    )
+    if session is None:
+        return JsonResponse({'detail': 'Session not found.'}, status=404)
+
+    candidate = CandidateProfile.objects.filter(
+        college=institution, user=session.user,
+    ).first()
+    if candidate is None:
+        return JsonResponse({'detail': 'Session not found in your college.'}, status=404)
+
+    # An unanalysed session scores 0 on every dimension, which would read on the
+    # card as a student who scored zero. Nulls are the honest answer here and the
+    # page prints them as "not analysed" rather than as a number.
+    analyzed = session.finalized_at is not None
+    scores = {
+        field: (_as_number(getattr(session, field, None)) if analyzed else None)
+        for field in _ENGLISH_ANALYSIS_FIELDS
+    }
+
+    return JsonResponse({
+        'student': {
+            'id': str(candidate.candidate_id),
+            'full_name': candidate.full_name,
+        },
+        'module': 'english',
+        'module_label': PERF_MODULE_LABELS['english'],
+        'session': {
+            'id': str(session.pk),
+            'title': session.title or 'English writing practice',
+            'status': session.status,
+            'finalized_at': session.finalized_at.isoformat() if session.finalized_at else None,
+            'created_at': session.created_at.isoformat(),
+            'updated_at': session.updated_at.isoformat(),
+            'scores': scores,
+            'mistakes': _clean_english_mistakes(session.mistakes) if analyzed else [],
+            'transcript': [
+                {
+                    'role': str(entry.get('role') or ''),
+                    'content': str(entry.get('content') or ''),
+                    'created_at': entry.get('created_at'),
+                }
+                for entry in (session.transcript or [])
+                if isinstance(entry, dict) and entry.get('content')
+            ],
+            **{
+                field: getattr(session, field, '') or ''
+                for field in _ENGLISH_ANALYSIS_TEXT_FIELDS
+            },
+        },
     })
 
 
@@ -15900,6 +18586,25 @@ def drive_create(request):
         ),
         offer_status=_as_choice(data.get('offer_status'), OFFER_STATUS_CHOICES, 'pending'),
     )
+    # The drive is the one create here a student can act on today, so it goes
+    # out the moment it is on the board: the deadline and the vacancy count are
+    # the two facts that decide whether the notice is worth opening.
+    deadline = (
+        drive.application_deadline.strftime('%d %b %Y')
+        if drive.application_deadline else None
+    )
+    _broadcast_institution_news(
+        institution,
+        request.user,
+        f'{company.company_name} has opened a campus drive',
+        f'{drive.title} is open'
+        + (f' for {drive.role}' if drive.role else '')
+        + (f' with {drive.total_vacancies} openings'
+           if drive.total_vacancies else '')
+        + (f'. Apply by {deadline}.' if deadline else '.')
+        + ' Check the company drives page.',
+        '/company-drives',
+    )
     return JsonResponse({
         'drive': _drive_payload(
             drive, _eligible_student_count(institution, drive), drive.vacancies,
@@ -16005,8 +18710,6 @@ def reports_data(request):
     if years:
         end_year = max(years)
 
-    verified = candidates.filter(id_verified=True).count()
-
     return JsonResponse({
         'kpis': kpis,
         'monthly': _monthly_students(institution),
@@ -16020,8 +18723,6 @@ def reports_data(request):
         'batch': {
             'year': end_year or 2026,
             'students': total,
-            'verified': verified,
-            'unverified': total - verified,
         },
     })
 

@@ -11,6 +11,9 @@ from .models import (
     CandidateRoadmap,
     ChatMessage,
     ChatSession,
+    ClassroomLDSession,
+    ClientChatMessage,
+    ClientChatSession,
     ClientProfile,
     CommunicationTraining,
     Company,
@@ -131,7 +134,6 @@ class InstitutionAdmin(admin.ModelAdmin):
                 'approximate_student_strength',
                 'courses_offered',
                 'departments',
-                'companies',
             ),
         }),
     )
@@ -223,6 +225,8 @@ class CompanyAdmin(admin.ModelAdmin):
                 'company_name',
                 'industry',
                 'company_description',
+                'website',
+                'company_logo',
             ),
         }),
         ('AI profile', {
@@ -364,7 +368,6 @@ class CandidateProfileAdmin(admin.ModelAdmin):
         'start_year',
         'end_year',
         'placement_status',
-        'id_verified',
         'cost_incurred',
         'time_spent',
     )
@@ -376,7 +379,6 @@ class CandidateProfileAdmin(admin.ModelAdmin):
         'gender',
         'placement_status',
         'account_status',
-        'id_verified',
     )
     search_fields = (
         'candidate_id',
@@ -485,6 +487,33 @@ class ChatSessionAdmin(admin.ModelAdmin):
     autocomplete_fields = ('user',)
     readonly_fields = ('id', 'created_at', 'updated_at', 'message_count')
     inlines = (ChatMessageInline,)
+
+    @admin.display(description='User')
+    def user_name(self, obj):
+        return obj.user.get_full_name() or obj.user.username
+
+    @admin.display(description='Messages')
+    def message_count(self, obj):
+        return obj.messages.count()
+
+
+class ClientChatMessageInline(admin.TabularInline):
+    model = ClientChatMessage
+    extra = 0
+    readonly_fields = ('role', 'content', 'created_at')
+    can_delete = True
+
+
+@admin.register(ClientChatSession)
+class ClientChatSessionAdmin(admin.ModelAdmin):
+    """Mirror of the student ChatSession admin, kept separate so placement
+    conversations are never edited through the student chat admin."""
+
+    list_display = ('title', 'user_name', 'message_count', 'created_at', 'updated_at')
+    search_fields = ('title', 'user__email', 'user__first_name', 'user__last_name')
+    autocomplete_fields = ('user',)
+    readonly_fields = ('id', 'created_at', 'updated_at', 'message_count')
+    inlines = (ClientChatMessageInline,)
 
     @admin.display(description='User')
     def user_name(self, obj):
@@ -1094,6 +1123,20 @@ class StudentMessageAdmin(admin.ModelAdmin):
     @admin.display(description='Content')
     def content_preview(self, obj):
         return obj.content[:60] or '-'
+
+
+@admin.register(ClassroomLDSession)
+class ClassroomLDSessionAdmin(admin.ModelAdmin):
+    list_display = (
+        'topic', 'department', 'faculty_name', 'venue', 'starts_at', 'ends_at', 'institution',
+    )
+    list_filter = ('institution',)
+    search_fields = ('topic', 'agenda', 'venue', 'faculty_name', 'department')
+    ordering = ('starts_at', 'topic')
+    date_hierarchy = 'starts_at'
+    autocomplete_fields = ('created_by',)
+    readonly_fields = ('id', 'created_at', 'updated_at')
+    list_select_related = ('institution', 'created_by')
 
 
 
