@@ -5,6 +5,9 @@ from . import views
 app_name = 'TalentBroIns'
 
 urlpatterns = [
+    # Ahead of everything else and not behind a login: the SPA asks this before
+    # it renders any route, so it has to answer for signed-out visitors too.
+    path('site-status/', views.site_status, name='site-status'),
     path('auth/csrf/', views.csrf, name='auth-csrf'),
     path('auth/signup/', views.signup, name='auth-signup'),
     path('auth/login/', views.login_view, name='auth-login'),
@@ -95,6 +98,26 @@ urlpatterns = [
         views.classroom_ld_session_detail,
         name='classroom-ld-session-detail',
     ),
+    path(
+        'students-targets/',
+        views.students_targets,
+        name='students-targets',
+    ),
+    path(
+        'students-targets/create/',
+        views.students_target_create,
+        name='students-target-create',
+    ),
+    path(
+        'students-targets/<uuid:target_id>/',
+        views.students_target_detail,
+        name='students-target-detail',
+    ),
+    path(
+        'my-training-targets/',
+        views.my_training_targets,
+        name='my-training-targets',
+    ),
     path('reports/', views.reports_data, name='reports-data'),
     path('courses/', views.courses_list, name='courses-list'),
     path('courses/segments/', views.course_weakness_segments, name='course-weakness-segments'),
@@ -178,6 +201,9 @@ urlpatterns = [
     path('notifications/', views.notifications, name='notifications-list'),
     path('notifications/mark-read/', views.notifications_mark_read, name='notifications-mark-read'),
     path('notifications/<uuid:notification_id>/', views.notification_detail, name='notification-detail'),
+
+    path('forum/posts/', views.forum_posts, name='forum-posts'),
+    path('forum/posts/<uuid:post_id>/', views.forum_post_detail, name='forum-post-detail'),
 
     path('gd/panelists/', views.gd_panelists, name='gd-panelists'),
     path('gd/chat/', views.gd_chat, name='gd-chat'),

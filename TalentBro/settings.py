@@ -152,7 +152,12 @@ ROOT_URLCONF = 'TalentBro.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        # The site downtime panel lives at templates/admin/index.html. It has to
+        # be here rather than inside an app: the app-dirs loader searches apps in
+        # INSTALLED_APPS order and django.contrib.admin is listed first, so a copy
+        # inside TalentBroIns would lose to Django's own admin/index.html and
+        # never be loaded.
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [

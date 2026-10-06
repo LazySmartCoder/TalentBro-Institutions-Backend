@@ -3,6 +3,8 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
 from django.contrib.auth.models import User
+from django.http import HttpResponseRedirect
+from django.urls import path, reverse
 
 from .models import (
     APLRTraining,
@@ -30,7 +32,9 @@ from .models import (
     Notification,
     NotificationReceipt,
     SituationalProblemSolvingTraining,
+    SiteSetting,
     StudentMessage,
+    Students_Target,
     TechnicalTraining,
     DSATraining,
 )
@@ -40,6 +44,73 @@ admin.site.site_title = "TalentBro Institutions"
 admin.site.index_title = "TalentBro Institutions Administration Panel for Management"
 
 admin.site.unregister(User)
+
+
+@admin.register(SiteSetting)
+class SiteSettingAdmin(admin.ModelAdmin):
+    """The Down/Up switch, and the toggle behind the dashboard button.
+
+    The changelist here is a list of exactly one row: the model's primary key is
+    pinned, so the add button and the delete button are both removed rather than
+    left to produce a second row that would quietly disagree with the first. The
+    change form is still worth keeping — it is where the downtime message is
+    written — it is just not where the switch is flipped.
+    """
+
+    list_display = ('site_down', 'message', 'updated_by', 'updated_at')
+    readonly_fields = ('updated_by', 'updated_at')
+    fields = ('site_down', 'message', 'updated_by', 'updated_at')
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def get_urls(self):
+        # The dashboard button posts here. Declared on the ModelAdmin rather than
+        # in the project's urls.py so the whole switch — the row, the endpoint,
+        # the button — stays in this one file, and the URL keeps the admin's
+        # session and CSRF checks for free through admin_view().
+        return [
+            path(
+                'toggle/',
+                self.admin_site.admin_view(self.toggle_view),
+                name='TalentBroIns_sitesetting_toggle',
+            ),
+        ] + super().get_urls()
+
+    # No @never_cache here: admin_view() already adds it, and decorating a bound
+    # method with it would hand `self` to the middleware as the request.
+    def toggle_view(self, request):
+        """Flip the switch and return to whatever page asked.
+
+        POST only. A GET here would mean a prefetcher, a "restore session" prompt
+        or somebody following a stray link could take the site down or bring it
+        back up, so anything but a POST is redirected home untouched.
+        """
+        if request.method != 'POST':
+            return HttpResponseRedirect(reverse('admin:index'))
+
+        setting = SiteSetting.load()
+        setting.site_down = not setting.site_down
+        setting.updated_by = request.user
+        setting.save()
+
+        if setting.site_down:
+            self.message_user(
+                request,
+                'Site is DOWN. Every page except the home page now shows the '
+                'downtime page.',
+                level='warning',
+            )
+        else:
+            self.message_user(request, 'Site is UP. Every page is serving normally again.')
+
+        # `next` lets a button on some other admin page (the Site availability
+        # change form, say) send the operator back where they were.
+        destination = request.POST.get('next') or reverse('admin:index')
+        return HttpResponseRedirect(destination)
 
 
 class TalentBroUserForm(UserChangeForm):
@@ -1137,6 +1208,36 @@ class ClassroomLDSessionAdmin(admin.ModelAdmin):
     autocomplete_fields = ('created_by',)
     readonly_fields = ('id', 'created_at', 'updated_at')
     list_select_related = ('institution', 'created_by')
+
+
+@admin.register(Students_Target)
+class StudentsTargetAdmin(admin.ModelAdmin):
+    """The training targets a placement officer has launched.
+
+    The students a target covers are the many-to-many rather than a column, and a
+    department-scoped target resolves its audience at read time — so the changelist
+    prints the audience label the board prints instead of a stored headcount that
+    would quietly go stale as students join or leave a department.
+    """
+    list_display = (
+        'title', 'audience_label', 'total_count', 'due_on', 'is_open',
+        'institution', 'created_by',
+    )
+    list_filter = ('institution',)
+    search_fields = ('title', 'department', 'notes')
+    ordering = ('-created_at',)
+    date_hierarchy = 'due_on'
+    # `candidates` is picked through filter_horizontal rather than autocomplete: the
+    # two widgets cannot share a field, and for a college of any size a two-box
+    # picker with a search is the workable one.
+    autocomplete_fields = ('created_by',)
+    filter_horizontal = ('candidates',)
+    readonly_fields = ('id', 'created_at', 'updated_at')
+    list_select_related = ('institution', 'created_by')
+
+    @admin.display(description='Open', boolean=True)
+    def is_open(self, obj):
+        return obj.is_open()
 
 
 

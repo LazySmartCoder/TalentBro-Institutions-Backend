@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import RegexValidator
+from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
 from django.utils import timezone
 
@@ -678,6 +678,7 @@ class CandidateProfile(models.Model):
     )
 
     preferred_roles = models.JSONField(default=list, blank=True)
+
     preferred_locations = models.JSONField(default=list, blank=True)
     preferred_language = models.CharField(
         max_length=30, blank=True, default='',
@@ -790,8 +791,37 @@ class CandidateProfile(models.Model):
         help_text='Department size of the self-training ranking cohort.',
     )
 
+    client_targets = models.JSONField(
+        default=dict, blank=True,
+        help_text=(
+            "This candidate's progress against the training targets their "
+            "institution has set, keyed by target id. Written by "
+            "`sync_client_targets()` — never by hand. Empty when no target "
+            "covers this candidate."
+        ),
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def sync_client_targets(self, commit=True):
+        """Recompute this candidate's progress against every target covering them.
+
+        The JSON on the row is a cache, not the record: the authoritative count
+        is always worked out from the practice tables inside the target's own
+        window, so a student who deletes a session, or whose practice row was
+        backdated, cannot leave a stale number sitting on their profile claiming
+        credit. Every read therefore re-derives, and the stored value exists so
+        the placement side and the profile screen can read one row instead of
+        re-running nine aggregates per candidate.
+
+        Only targets that actually cover this candidate produce an entry, and a
+        target withdrawn or deleted drops out on the next sync. A candidate with
+        no target gets an empty dict rather than a row full of zeroes.
+        """
+        from TalentBroIns.views import sync_client_targets
+
+        return sync_client_targets(self, commit=commit)
 
     class Meta:
         ordering = ['first_name', 'last_name']
@@ -832,7 +862,7 @@ CHAT_ROLE_CHOICES = [
 
 
 class ChatSession(models.Model):
-    """Persisted student↔TalentBro Gemini conversation."""
+    """Persisted studentTalentBro Gemini conversation."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
@@ -848,7 +878,8 @@ class ChatSession(models.Model):
         ordering = ['-updated_at']
 
     def __str__(self):
-        return f'{self.title or "Untitled chat"} ({self.user.get_full_name() or self.user.username})'
+        label = self.title or 'Untitled chat'
+        return f'{label} ({self.user.get_full_name() or self.user.username})'
 
 
 class ChatMessage(models.Model):
@@ -1797,10 +1828,15 @@ class EnglishTrainingSession(models.Model):
 NOTIFICATION_SENDER_CHOICES = [
     ('placement_cell', 'Placement Cell'),
     ('platform', 'TalentBro Platform'),
+    # Raised automatically when somebody posts to their college's Discussion
+    # Forum, so the notice names the forum rather than pretending the placement
+    # cell said it. Always scoped to the poster's own institution.
+    ('forum', 'Discussion Forum'),
 ]
 
 NOTIFICATION_SENDER_PLACEMENT_CELL = 'placement_cell'
 NOTIFICATION_SENDER_PLATFORM = 'platform'
+NOTIFICATION_SENDER_FORUM = 'forum'
 
 
 class Notification(models.Model):
@@ -1882,6 +1918,15 @@ class Notification(models.Model):
             raise ValidationError(
                 {'institution': 'A platform broadcast cannot be scoped to an institution.'}
             )
+        if self.sender == NOTIFICATION_SENDER_FORUM:
+            if not self.institution_id:
+                raise ValidationError(
+                    {'institution': 'A forum notice must name the college it was posted in.'}
+                )
+            if self.recipient_id:
+                raise ValidationError(
+                    {'recipient': 'A forum notice goes to the whole college, not one user.'}
+                )
 
 
 class NotificationReceipt(models.Model):
@@ -2279,3 +2324,409 @@ class ClassroomLDSession(models.Model):
             raise ValidationError(
                 {'ends_at': 'The session must end after it starts.'}
             )
+
+
+class ForumPost(models.Model):
+    """One text post on a college's Discussion Forum.
+
+    The forum is intra-institution, so a post carries the college it was written
+    in and is only ever listed to signed-in members of that same college. There is
+    no cross-college feed and no way to address another institution.
+
+    ``author`` is the CandidateProfile that wrote the post rather than the auth
+    User, because the forum is the candidate's own surface and the profile already
+    holds the name, department and program the feed renders on every row.
+    ``institution`` is stored alongside it instead of being derived at read time so
+    a post can never end up filed under a college its author has since left, and
+    so the feed is a single indexed lookup on one column.
+
+    Deliberately minimal: text only, no title, no attachments, no votes and no
+    comment thread. ``updated_at`` exists for the record but nothing edits a post —
+    the UI offers delete only, and a repost is a new row.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        Institution,
+        on_delete=models.CASCADE,
+        related_name='forum_posts',
+        help_text='The college this post belongs to. Scopes the whole forum.',
+    )
+    author = models.ForeignKey(
+        CandidateProfile,
+        on_delete=models.CASCADE,
+        related_name='forum_posts',
+        help_text='The candidate profile that wrote this post.',
+    )
+    body = models.TextField(
+        help_text='The post text. Plain text only — no markup, no attachments.',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'forum_post'
+        # Newest first, with the id as the tiebreak so two posts landing in the
+        # same microsecond still page in a stable order.
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        return f'{self.author_id} @ {self.institution_id}: {self.body[:40]}'
+
+
+# What the downtime page says when the admin has not written a message of their
+# own. Kept here rather than in the frontend so the wording is decided in one
+# place and the API always has something to send.
+DEFAULT_DOWNTIME_MESSAGE = (
+    'We are carrying out scheduled maintenance on TalentBro. '
+    'The site will be back shortly.'
+)
+
+
+class SiteSetting(models.Model):
+    """Whether the site is serving right now, and what to say if it is not.
+
+    This is the single row behind the Down/Up button on the admin dashboard.
+    There is exactly one of these: the row is pinned to a fixed primary key
+    rather than carrying a "which one is the real one" column, so a second row
+    cannot be created to disagree with the first.
+
+    While ``site_down`` is true the SPA replaces every page except the home page
+    with the downtime page. The home page is left alone on purpose — it is the
+    public marketing page and stays readable so anyone following a link from
+    outside still lands somewhere sensible.
+    """
+
+    # One row, forever. 1 is as arbitrary as 0; what matters is that it never
+    # varies, because both `load()` and the admin assume it.
+    SINGLETON_PK = 1
+
+    site_down = models.BooleanField(
+        default=False,
+        verbose_name='Site is down',
+        help_text=(
+            'While ticked, every page except the home page is replaced with the '
+            'downtime page. Unticked means the site is serving normally.'
+        ),
+    )
+    message = models.CharField(
+        max_length=300,
+        blank=True,
+        default='',
+        verbose_name='Downtime message',
+        help_text=(
+            'Shown on the downtime page. Left blank, '
+            f'{DEFAULT_DOWNTIME_MESSAGE!r} is used instead.'
+        ),
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='site_setting_updates',
+        help_text='The staff member who last flipped the switch.',
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'site_setting'
+        # Singular on purpose: there is one row, so the changelist is a list of
+        # length one and the wording never has to defend itself in the plural.
+        verbose_name = 'Site availability'
+        verbose_name_plural = 'Site availability'
+
+    def __str__(self):
+        return 'DOWN — showing the downtime page' if self.site_down else 'UP — serving normally'
+
+    @classmethod
+    def load(cls):
+        """The one row, created the first time anything asks for it.
+
+        Callers include a public, unauthenticated status endpoint that every page
+        load hits, so this deliberately does not raise on a missing table or row:
+        a site nobody has ever switched is simply up. `get_or_create` is one
+        indexed SELECT once the row exists, and it swallows the race between two
+        first-time requests.
+        """
+        row, _created = cls.objects.get_or_create(
+            pk=cls.SINGLETON_PK,
+            defaults={'message': DEFAULT_DOWNTIME_MESSAGE},
+        )
+        return row
+
+    @property
+    def display_message(self):
+        """The message to show, never blank."""
+        return self.message.strip() or DEFAULT_DOWNTIME_MESSAGE
+
+
+# The eight self-training modules a target can set a count against, in the order
+# the /daily-targets screen lists them. Spelled out rather than generated so both
+# the model and the migration below are a frozen record of the same set, and so a
+# module added to one and not the other is a visible diff rather than a silent
+# mismatch.
+#
+#   (field name, module key, human label, short label for tight surfaces)
+STUDENT_TARGET_MODULES = [
+    ('communication_count', 'communication', 'Communication Skills', 'Communication'),
+    ('group_discussion_count', 'group_discussion', 'Group Discussion', 'Group Discussion'),
+    ('aplr_count', 'aplr', 'Aptitude & Logical Reasoning', 'APLR'),
+    ('basic_math_count', 'basic_math', 'Mathematics', 'Mathematics'),
+    ('english_count', 'english', 'English Trainer', 'English'),
+    ('situational_count', 'situational',
+     'Situational Problem Solving Skills (Management)', 'Situational'),
+    ('technical_count', 'technical',
+     'Problem Solving Skills (Technical)', 'Technical'),
+    ('dsa_count', 'dsa', 'DSA (Data Structures & Algorithms)', 'DSA'),
+]
+
+# The ceiling on any one count on a target. Far higher than the 20 a *daily*
+# target is capped at, because this row runs to a due date rather than to
+# midnight — but still bounded, so a mistyped 20000 cannot be committed and then
+# read back as a real number forever.
+STUDENT_TARGET_MAX_COUNT = 100
+
+# The validators every count on a target shares. Spelled out once so the bound is
+# the same number in the column, in the admin and in the API — a validator list
+# holds stateless value objects, so one instance is safely shared by all nine.
+STUDENT_TARGET_COUNT_VALIDATORS = [
+    MinValueValidator(0),
+    MaxValueValidator(STUDENT_TARGET_MAX_COUNT),
+]
+
+
+class Students_Target(models.Model):
+    """One training target a placement officer has set for their college.
+
+    A target is a commitment, not a measurement: "every CSE student clears 20 DSA
+    items and 2 mock interviews by the 30th". It is one row per commitment, so a
+    college running four of them has four rows and each can be closed or withdrawn
+    on its own.
+
+    **Who it covers.** Two audiences, and a target must have at least one:
+
+    * a *department* — free text matching ``CandidateProfile.department``, resolved
+      at read time so a student who joins the department next month is covered by
+      the target already on the board. It is free text rather than a foreign key
+      for the same reason ``ClassroomLDSession.department`` is: department names
+      are the college's own, typed as free text on the profile, and a target should
+      be able to be campus-wide.
+    * specific *students* — the ``candidates`` many-to-many below.
+
+    Both may be set at once, which is how "all of CSE, plus the two ECE students
+    who sit with them" is expressed.
+
+    **What it asks for.** One count per self-training module plus a mock-interview
+    count, each its own column rather than a JSON blob: these are aggregated and
+    reported on per module all over the app (the L&D skill radar, the student's
+    own dashboard), and a column can be summed and compared in the database while
+    a JSON value has to be read row by row.
+
+    **When.** ``starts_on`` defaults to the day it is created and ``due_on`` is the
+    deadline it is judged against, so the progress on a target is measured over a
+    known window rather than lifetime.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    institution = models.ForeignKey(
+        Institution,
+        on_delete=models.CASCADE,
+        related_name='students_targets',
+        help_text='The college this target belongs to. Scopes the whole board.',
+    )
+    title = models.CharField(
+        max_length=255,
+        help_text='What this target is called on the board, e.g. "CSE DSA sprint".',
+    )
+    department = models.CharField(
+        max_length=120,
+        blank=True,
+        default='',
+        help_text=(
+            'Department this target covers, matched against CandidateProfile.department. '
+            'Leave blank for a campus-wide target.'
+        ),
+    )
+    candidates = models.ManyToManyField(
+        CandidateProfile,
+        related_name='students_targets',
+        blank=True,
+        help_text='Specific students this target covers, alongside the department.',
+    )
+
+    communication_count = models.PositiveIntegerField(
+        default=0, help_text='How many Communication Skills items are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+    group_discussion_count = models.PositiveIntegerField(
+        default=0, help_text='How many Group Discussion items are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+    aplr_count = models.PositiveIntegerField(
+        default=0, help_text='How many APLR items are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+    basic_math_count = models.PositiveIntegerField(
+        default=0, help_text='How many Mathematics items are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+    english_count = models.PositiveIntegerField(
+        default=0, help_text='How many English Trainer items are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+    situational_count = models.PositiveIntegerField(
+        default=0,
+        help_text='How many Situational Problem Solving items are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+    technical_count = models.PositiveIntegerField(
+        default=0, help_text='How many Technical problem-solving items are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+    dsa_count = models.PositiveIntegerField(
+        default=0, help_text='How many DSA items are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+    mock_interview_count = models.PositiveIntegerField(
+        default=0, help_text='How many mock interviews are targeted.',
+        validators=STUDENT_TARGET_COUNT_VALIDATORS,
+    )
+
+    starts_on = models.DateField(
+        null=True,
+        blank=True,
+        help_text='Day the target starts counting from. Blank means it starts today.',
+    )
+    due_on = models.DateField(
+        help_text='Day the target is judged against.',
+    )
+    notes = models.TextField(
+        blank=True,
+        default='',
+        help_text='Anything the officer wants beside the numbers, e.g. how to prepare.',
+    )
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='students_targets_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'students_target'
+        # Newest first, so the board's default list reads as a log of what has
+        # been launched rather than a timetable of what is coming.
+        ordering = ['-created_at']
+        verbose_name = 'Student target'
+        verbose_name_plural = 'Student targets'
+
+    def __str__(self):
+        return f'{self.title} ({self.audience_label}, due {self.due_on:%d %b %Y})'
+
+    def clean(self):
+        super().clean()
+        if self.due_on and self.starts_on and self.due_on < self.starts_on:
+            raise ValidationError(
+                {'due_on': 'The target is due before it starts.'}
+            )
+        if self.total_count == 0:
+            raise ValidationError(
+                {'title': 'Set at least one number before launching a target.'}
+            )
+
+    # --- the numbers a target asks for -------------------------------------
+
+    @property
+    def module_counts(self):
+        """``{module key: count}`` for every self-training module, zeros included.
+
+        Always carries every key so the board can render a row per module without
+        having to know which ones this target happens to use.
+        """
+        return {
+            key: int(getattr(self, field) or 0)
+            for field, key, _label, _short in STUDENT_TARGET_MODULES
+        }
+
+    @property
+    def self_training_count(self):
+        """Total self-training items asked for, across every module."""
+        return sum(self.module_counts.values())
+
+    @property
+    def total_count(self):
+        """Everything this target asks for: self-training plus mock interviews."""
+        return self.self_training_count + int(self.mock_interview_count or 0)
+
+    # --- who it covers -----------------------------------------------------
+
+    @property
+    def audience_label(self):
+        """Short description of the audience, for a board row with room for one line."""
+        attached = self.candidates.count()
+        if self.department:
+            return f'{self.department} + {attached}' if attached else self.department
+        if not attached:
+            return 'No one yet'
+        return f'{attached} student' + ('' if attached == 1 else 's')
+
+    def candidate_queryset(self):
+        """The students this target covers, resolved now.
+
+        A department target is resolved at read time rather than snapshotted, so a
+        student who joins the department after the target was launched is covered
+        by it — which is what "all of CSE by the 30th" means. A blank department
+        with no attached students resolves to nothing rather than to the whole
+        college, so an empty draft is visible on the board instead of quietly
+        reading as campus-wide.
+        """
+        if not self.department and not self.candidates.exists():
+            return CandidateProfile.objects.none()
+        parts = []
+        if self.department:
+            parts.append(
+                CandidateProfile.objects.filter(
+                    college=self.institution,
+                    department__iexact=self.department.strip(),
+                )
+            )
+        if self.candidates.exists():
+            parts.append(
+                CandidateProfile.objects.filter(
+                    college=self.institution, students_targets__pk=self.pk,
+                )
+            )
+        qs = parts[0]
+        for extra in parts[1:]:
+            qs = qs | extra
+        return qs.distinct()
+
+    # --- where it stands ----------------------------------------------------
+
+    @property
+    def window_start(self):
+        """First day progress is measured from.
+
+        A blank ``starts_on`` means the day the target was launched — which is what
+        the field's help text promises. Falling back to ``due_on`` instead would
+        silently shrink the window to the deadline day alone, so a three-week target
+        would be judged on what the students did on its last day.
+        """
+        if self.starts_on:
+            return self.starts_on
+        if self.created_at:
+            return timezone.localtime(self.created_at).date()
+        return self.due_on
+
+    def is_open(self, today=None):
+        """True while the due date has not passed."""
+        today = today or timezone.localdate()
+        return self.due_on >= today
+
+    def is_expired(self, today=None):
+        return not self.is_open(today)
